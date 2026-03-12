@@ -17,6 +17,7 @@ import { Chat } from './components/Chat';
 import { AdminPanel } from './components/AdminPanel';
 import { Login } from './components/Login';
 import { Settings } from './components/Settings';
+import { ChangePasswordModal } from './components/ChangePasswordModal';
 import { cn } from './lib/utils';
 import { apiFetch, removeToken, getToken } from './api';
 
@@ -185,6 +186,17 @@ export default function App() {
     return <Login onLogin={setUser} />;
   }
 
+  if (user.mustChangePassword) {
+    return (
+      <ChangePasswordModal
+        onSuccess={async () => {
+          const data = await apiFetch('/api/auth/me');
+          setUser(data.user);
+        }}
+      />
+    );
+  }
+
   return (
     <div className="flex h-screen bg-slate-50 font-sans text-slate-900 overflow-hidden">
       {/* Mobile sidebar overlay */}
@@ -197,7 +209,7 @@ export default function App() {
 
       {/* Sidebar */}
       <aside className={cn(
-        "fixed inset-y-0 left-0 z-30 w-72 bg-white border-r border-slate-200 transform transition-transform duration-300 ease-in-out lg:translate-x-0 lg:static lg:flex-shrink-0 flex flex-col",
+        "fixed inset-y-0 left-0 z-30 w-72 bg-white border-r border-slate-200 transform transition-transform duration-300 ease-in-out lg:translate-x-0 lg:static lg:shrink-0 flex flex-col",
         isSidebarOpen ? "translate-x-0" : "-translate-x-full"
       )}>
         <div className="p-6 border-b border-slate-100 flex items-center justify-between">
@@ -233,7 +245,7 @@ export default function App() {
                 )}
               >
                 <mod.icon className={cn(
-                  "flex-shrink-0 mt-0.5",
+                  "shrink-0 mt-0.5",
                   currentView === 'chat' && activeModule.id === mod.id ? "text-indigo-600" : "text-slate-400"
                 )} size={20} />
                 <div>
@@ -268,7 +280,7 @@ export default function App() {
                 )}
               >
                 <mod.icon className={cn(
-                  "flex-shrink-0 mt-0.5",
+                  "shrink-0 mt-0.5",
                   currentView === 'chat' && activeModule.id === mod.id ? "text-emerald-600" : "text-slate-400"
                 )} size={20} />
                 <div>
@@ -308,7 +320,7 @@ export default function App() {
                     }}
                   >
                     <div className="flex items-center gap-3 overflow-hidden">
-                      <MessageCircle size={16} className="flex-shrink-0" />
+                      <MessageCircle size={16} className="shrink-0" />
                       <span className="text-sm truncate">{thread.title || '新对话'}</span>
                     </div>
                     <button
@@ -344,7 +356,7 @@ export default function App() {
                   )}
                 >
                   <Database className={cn(
-                    "flex-shrink-0 mt-0.5",
+                    "shrink-0 mt-0.5",
                     currentView === 'admin' ? "text-amber-600" : "text-slate-400"
                   )} size={20} />
                   <div>
@@ -371,7 +383,7 @@ export default function App() {
                   )}
                 >
                   <ShieldCheck className={cn(
-                    "flex-shrink-0 mt-0.5",
+                    "shrink-0 mt-0.5",
                     currentView === 'settings' ? "text-indigo-600" : "text-slate-400"
                   )} size={20} />
                   <div>

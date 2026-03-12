@@ -186,7 +186,8 @@ CRITICAL - Final Answer Requirement:
         messages: openAiMessages,
         tools: tools as any,
         temperature: 0.2,
-      });
+        enable_thinking: false, // 关闭思考模式以加快响应（SiliconFlow 等默认开启）
+      } as any);
 
       if (!response || !response.choices || !response.choices[0]) {
         throw new Error(
@@ -327,7 +328,8 @@ CRITICAL - Final Answer Requirement:
           messages: openAiMessages,
           tools: tools as any,
           temperature: 0.2,
-        });
+          enable_thinking: false,
+        } as any);
 
         if (!response || !response.choices || !response.choices[0]) {
           throw new Error(
@@ -356,7 +358,8 @@ CRITICAL - Final Answer Requirement:
           tools: tools as any,
           tool_choice: 'none',
           temperature: 0.2,
-        });
+          enable_thinking: false,
+        } as any);
         if (synthResponse?.choices?.[0]?.message?.content) {
           finalContent = synthResponse.choices[0].message.content.trim();
         }

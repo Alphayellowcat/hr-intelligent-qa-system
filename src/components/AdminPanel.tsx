@@ -154,6 +154,7 @@ Return ONLY the raw Markdown content for the 'content' field.`;
         model: 'dummy',
         messages: [{ role: 'user', content: prompt }],
         temperature: 0.2,
+        enable_thinking: false,
         tools: [{
           type: "function",
           function: {
@@ -172,7 +173,7 @@ Return ONLY the raw Markdown content for the 'content' field.`;
           }
         }],
         tool_choice: { type: "function", function: { name: "generate_document" } }
-      });
+      } as any);
 
       if (!response || !response.choices || !response.choices[0]) {
         throw new Error(

@@ -44,6 +44,33 @@ app.use('/api/openai/v1/embeddings', embedLimiter);
 
 const KNOWLEDGE_DIR = path.join(process.cwd(), 'knowledge');
 
+// --- 密码哈希工具（使用 Node 内置 crypto.scrypt）---
+function hashPassword(password: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const salt = crypto.randomBytes(16).toString('hex');
+    crypto.scrypt(password, salt, 64, (err, derivedKey) => {
+      if (err) reject(err);
+      else resolve(`${salt}:${derivedKey.toString('hex')}`);
+    });
+  });
+}
+function verifyPassword(password: string, stored: string): Promise<boolean> {
+  const [salt, hash] = stored.split(':');
+  if (!salt || !hash) return Promise.resolve(false);
+  return new Promise((resolve, reject) => {
+    crypto.scrypt(password, salt, 64, (err, derivedKey) => {
+      if (err) reject(err);
+      else {
+        try {
+          resolve(crypto.timingSafeEqual(Buffer.from(hash, 'hex'), derivedKey));
+        } catch {
+          resolve(false);
+        }
+      }
+    });
+  });
+}
+
 // --- Database Setup ---
 const db = new Database('app.db');
 db.pragma('journal_mode = WAL');
@@ -87,10 +114,45 @@ db.exec(`
   );
 `);
 
-// Seed default users
-const insertUser = db.prepare('INSERT OR IGNORE INTO users (username, password, role) VALUES (?, ?, ?)');
-insertUser.run('admin', 'admin123', 'admin');
-insertUser.run('employee', 'emp123', 'employee');
+// 迁移：添加 must_change_password 列（若不存在）
+try {
+  const cols = db.prepare('PRAGMA table_info(users)').all() as { name: string }[];
+  if (!cols.some((c) => c.name === 'must_change_password')) {
+    db.exec('ALTER TABLE users ADD COLUMN must_change_password INTEGER DEFAULT 0');
+  }
+} catch (_) {}
+
+// Seed default users（异步，需在 initDb 中调用）
+async function seedUsers() {
+  const adminPw = process.env.ADMIN_INITIAL_PASSWORD || 'admin123';
+  const empPw = 'emp123';
+  const adminHash = await hashPassword(adminPw);
+  const empHash = await hashPassword(empPw);
+
+  const insertUser = db.prepare(
+    'INSERT OR IGNORE INTO users (username, password, role, must_change_password) VALUES (?, ?, ?, ?)'
+  );
+  insertUser.run('admin', adminHash, 'admin', 1);
+  insertUser.run('employee', empHash, 'employee', 0);
+
+  // 迁移：对已有明文密码进行哈希
+  const users = db.prepare('SELECT id, username, password FROM users').all() as {
+    id: number;
+    username: string;
+    password: string;
+  }[];
+  for (const u of users) {
+    if (!u.password.includes(':')) {
+      const hash = await hashPassword(u.password);
+      const mustChange = u.username === 'admin' ? 1 : 0;
+      db.prepare('UPDATE users SET password = ?, must_change_password = ? WHERE id = ?').run(
+        hash,
+        mustChange,
+        u.id
+      );
+    }
+  }
+}
 
 // Seed default settings (no real API key - configure in Settings UI)
 const insertSetting = db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)');
@@ -109,10 +171,15 @@ const authMiddleware = (req: any, res: any, next: any) => {
   
   if (!session) return res.status(401).json({ error: 'Invalid session' });
   
-  const user = db.prepare('SELECT id, username, role FROM users WHERE id = ?').get(session.user_id) as any;
+  const user = db.prepare('SELECT id, username, role, must_change_password FROM users WHERE id = ?').get(
+    session.user_id
+  ) as any;
   if (!user) return res.status(401).json({ error: 'User not found' });
   
-  req.user = user;
+  req.user = {
+    ...user,
+    mustChangePassword: !!user.must_change_password
+  };
   req.token = token;
   next();
 };
@@ -120,19 +187,34 @@ const authMiddleware = (req: any, res: any, next: any) => {
 // --- API Routes ---
 
 // Auth
-app.post('/api/auth/login', (req, res) => {
-  const { username, password } = req.body;
-  const user = db.prepare('SELECT * FROM users WHERE username = ? AND password = ?').get(username, password) as any;
-  
-  if (!user) return res.status(401).json({ error: '用户名或密码错误' });
-  
-  const token = crypto.randomBytes(32).toString('hex');
-  db.prepare('INSERT INTO sessions (token, user_id) VALUES (?, ?)').run(token, user.id);
-  
-  res.json({ token, user: { id: user.id, username: user.username, role: user.role } });
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username) as any;
+    if (!user) return res.status(401).json({ error: '用户名或密码错误' });
+
+    const valid =
+      user.password.includes(':') ? await verifyPassword(password, user.password) : false;
+    if (!valid) return res.status(401).json({ error: '用户名或密码错误' });
+
+    const token = crypto.randomBytes(32).toString('hex');
+    db.prepare('INSERT INTO sessions (token, user_id) VALUES (?, ?)').run(token, user.id);
+
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        username: user.username,
+        role: user.role,
+        mustChangePassword: !!user.must_change_password
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ error: '登录失败，请稍后再试' });
+  }
 });
 
-app.post('/api/auth/register', (req, res) => {
+app.post('/api/auth/register', async (req, res) => {
   const { username, password } = req.body;
   
   if (!username || !password) {
@@ -157,13 +239,16 @@ app.post('/api/auth/register', (req, res) => {
   }
   
   try {
-    const result = db.prepare('INSERT INTO users (username, password, role) VALUES (?, ?, ?)').run(username, password, 'employee');
+    const hashed = await hashPassword(password);
+    const result = db
+      .prepare('INSERT INTO users (username, password, role, must_change_password) VALUES (?, ?, ?, ?)')
+      .run(username, hashed, 'employee', 0);
     const userId = result.lastInsertRowid;
-    
+
     const token = crypto.randomBytes(32).toString('hex');
     db.prepare('INSERT INTO sessions (token, user_id) VALUES (?, ?)').run(token, userId);
-    
-    res.json({ token, user: { id: userId, username, role: 'employee' } });
+
+    res.json({ token, user: { id: userId, username, role: 'employee', mustChangePassword: false } });
   } catch (err) {
     res.status(500).json({ error: '注册失败，请稍后再试' });
   }
@@ -172,6 +257,34 @@ app.post('/api/auth/register', (req, res) => {
 app.post('/api/auth/logout', authMiddleware, (req: any, res) => {
   db.prepare('DELETE FROM sessions WHERE token = ?').run(req.token);
   res.json({ success: true });
+});
+
+app.post('/api/auth/change-password', authMiddleware, async (req: any, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ error: '当前密码和新密码不能为空' });
+    }
+    if (newPassword.length < 6) {
+      return res.status(400).json({ error: '新密码长度至少为6个字符' });
+    }
+
+    const user = db.prepare('SELECT password FROM users WHERE id = ?').get(req.user.id) as any;
+    if (!user) return res.status(404).json({ error: '用户不存在' });
+
+    const valid =
+      user.password.includes(':') ? await verifyPassword(currentPassword, user.password) : false;
+    if (!valid) return res.status(401).json({ error: '当前密码错误' });
+
+    const hashed = await hashPassword(newPassword);
+    db.prepare('UPDATE users SET password = ?, must_change_password = 0 WHERE id = ?').run(
+      hashed,
+      req.user.id
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: '修改密码失败，请稍后再试' });
+  }
 });
 
 app.get('/api/auth/me', authMiddleware, (req: any, res) => {
@@ -510,4 +623,8 @@ export async function startServer() {
   });
 }
 
-startServer();
+async function init() {
+  await seedUsers();
+  await startServer();
+}
+init();

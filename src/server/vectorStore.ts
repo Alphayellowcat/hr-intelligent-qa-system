@@ -29,6 +29,11 @@ function contentHash(text: string): string {
   return crypto.createHash('sha256').update(text, 'utf8').digest('hex').slice(0, 16);
 }
 
+const SAFE_ID_REGEX = /^[a-zA-Z0-9_\-\u4e00-\u9fff\/.#]+$/;
+function isSafeChunkId(id: string): boolean {
+  return typeof id === 'string' && SAFE_ID_REGEX.test(id) && !id.includes("'");
+}
+
 let db: lancedb.Connection | null = null;
 
 async function getDb(): Promise<lancedb.Connection> {
@@ -157,22 +162,18 @@ export async function indexKnowledge(
   let added = 0;
   let deleted = 0;
 
-  // 删除已移除的 chunks
+  // 删除已移除的 chunks（逐条删除 + ID 白名单校验，避免注入）
   if (toDelete.length > 0) {
     const tableNames = await connection.tableNames();
     if (tableNames.includes(TABLE_NAME)) {
       const table = await connection.openTable(TABLE_NAME);
-      const escaped = toDelete.map(id => `'${String(id).replace(/'/g, "''")}'`);
-      if (escaped.length <= 50) {
-        await table.delete(`id IN (${escaped.join(',')})`);
-      } else {
-        for (let i = 0; i < escaped.length; i += 50) {
-          const batch = escaped.slice(i, i + 50);
-          await table.delete(`id IN (${batch.join(',')})`);
-        }
+      for (const id of toDelete) {
+        if (!isSafeChunkId(id)) continue;
+        const escaped = id.replace(/'/g, "''");
+        await table.delete(`id = '${escaped}'`);
+        deleted++;
       }
-      deleted = toDelete.length;
-      onProgress(`已移除 ${deleted} 个过期段落`);
+      if (deleted > 0) onProgress(`已移除 ${deleted} 个过期段落`);
     }
   }
 
