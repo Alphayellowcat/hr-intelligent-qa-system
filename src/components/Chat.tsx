@@ -161,7 +161,15 @@ export function Chat({ mode, modeId, systemPrompt, welcomeMessage, knowledgeBase
         }
       }];
 
-      const agentInstruction = `${systemPrompt}\n\nYou have access to the company's knowledge base file system. You MUST use the provided tools (list_directory, read_file, search_files, semantic_search) to navigate the directories, find relevant files, and read their contents to answer the user's question. Think step-by-step like an agent. Combine exact search (search_files) and semantic search (semantic_search) to find the best information. Do not guess information.`;
+      const agentInstruction = `${systemPrompt}
+
+You have access to the company's knowledge base file system. You MUST use the provided tools (list_directory, read_file, search_files, semantic_search) to navigate the directories, find relevant files, and read their contents to answer the user's question.
+Think step-by-step like an agent. Combine exact search (search_files) and semantic search (semantic_search) to find the best information. Do not guess information.
+
+CRITICAL - Final Answer Requirement:
+- When calling tools, do NOT output content like "让我搜索" or "正在分析" - keep content empty or minimal.
+- When you have enough information, STOP calling tools and output ONLY your final answer: a clear, comprehensive, structured response that directly answers the user's question.
+- Your final response MUST be the actual answer (e.g. steps, conditions, procedures), NOT your retrieval process or intentions.`;
 
       // Build history
       const openAiMessages: any[] = [
@@ -330,11 +338,35 @@ export function Chat({ mode, modeId, systemPrompt, welcomeMessage, knowledgeBase
         }
       }
 
-      if (response.choices[0].message.content) {
+      let finalContent = (response.choices[0].message.content || '').trim();
+      const hasRetrievedInfo = referencedTitles.size > 0 || agentLogs.length > 0;
+      // 若内容为空或仅包含"让我搜索"等中间意图，且已有检索结果，则强制合成最终回答
+      const looksLikeIntermediate = !finalContent || /^(现在)?(让我|正在)(搜索|检索|分析|查找)/.test(finalContent) || (finalContent.length < 80 && /搜索|检索|分析/.test(finalContent));
+      const needsSynthesis = hasRetrievedInfo && (looksLikeIntermediate || (loopCount >= MAX_LOOPS && response.choices[0].message.tool_calls?.length));
+
+      if (needsSynthesis) {
+        setAgentStatus('正在生成最终回答...');
+        openAiMessages.push({
+          role: 'user',
+          content: '请根据上述检索到的所有文档内容，用清晰的结构化 Markdown 格式直接回答用户的原始问题。只输出最终答案，不要输出任何检索过程或"让我搜索"等内容。'
+        });
+        const synthResponse = await client.chat.completions.create({
+          model: 'dummy',
+          messages: openAiMessages,
+          tools: tools as any,
+          tool_choice: 'none',
+          temperature: 0.2,
+        });
+        if (synthResponse?.choices?.[0]?.message?.content) {
+          finalContent = synthResponse.choices[0].message.content.trim();
+        }
+      }
+
+      if (finalContent) {
         const assistantMessage: Message = {
           id: (Date.now() + 1).toString(),
           role: 'assistant',
-          content: response.choices[0].message.content,
+          content: finalContent,
           references: Array.from(referencedTitles),
           agentLogs: agentLogs.length > 0 ? agentLogs : undefined
         };
