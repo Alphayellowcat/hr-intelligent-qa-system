@@ -2,6 +2,9 @@ node_modules/
 build/
 dist/
 .lancedb/
+app.db
+app.db-shm
+app.db-wal
 coverage/
 .DS_Store
 *.log
