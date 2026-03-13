@@ -1,5 +1,15 @@
 # HR 智能问答系统
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Alphayellowcat/hr-intelligent-qa-system)
+[![license](https://img.shields.io/github/license/Alphayellowcat/hr-intelligent-qa-system)](https://github.com/Alphayellowcat/hr-intelligent-qa-system/blob/main/LICENSE)
+[![Node.js](https://img.shields.io/badge/Node.js-18+-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.8-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)](https://react.dev/)
+[![Vite](https://img.shields.io/badge/Vite-6-646CFF?logo=vite&logoColor=white)](https://vitejs.dev/)
+[![LanceDB](https://img.shields.io/badge/LanceDB-向量库-00D9FF)](https://lancedb.com/)
+[![OpenAI](https://img.shields.io/badge/OpenAI-Compatible-412991?logo=openai&logoColor=white)](https://platform.openai.com/)
+[![中文](https://img.shields.io/badge/语言-中文-red)]()
+
 基于大语言模型的医院人力资源智能问答系统，支持 24 小时自助问答、政策解读、入职引导、职业规划等功能。
 
 ## 功能模块
