@@ -40,7 +40,7 @@ export function Chat({ mode, modeId, systemPrompt, welcomeMessage, knowledgeBase
   const [isLoading, setIsLoading] = useState(false);
   const [agentStatus, setAgentStatus] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
-  const [showAgentDetails, setShowAgentDetails] = useState(false);
+  const [expandedAgentLogs, setExpandedAgentLogs] = useState<Record<string, boolean>>({});
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -66,7 +66,7 @@ export function Chat({ mode, modeId, systemPrompt, welcomeMessage, knowledgeBase
     loadThread();
     setError(null);
     setInput('');
-    setShowAgentDetails(false);
+    setExpandedAgentLogs({});
   }, [mode, welcomeMessage, threadId]);
 
   const scrollToBottom = () => {
@@ -444,6 +444,7 @@ CRITICAL - Final Answer Requirement:
   };
 
   const handleInputKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.nativeEvent.isComposing) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSubmit(e as unknown as React.FormEvent);
@@ -512,13 +513,18 @@ CRITICAL - Final Answer Requirement:
                   {msg.agentLogs && msg.agentLogs.length > 0 && (
                     <div className="mt-3 pt-3 border-t border-slate-200/60">
                       <button
-                        onClick={() => setShowAgentDetails((prev) => !prev)}
+                        onClick={() =>
+                          setExpandedAgentLogs((prev) => ({
+                            ...prev,
+                            [msg.id]: !prev[msg.id]
+                          }))
+                        }
                         className="text-xs text-slate-500 flex items-center gap-1.5 font-medium mb-1.5 hover:text-slate-700"
                       >
                         <FolderTree size={14} className="text-indigo-500" />
-                        {showAgentDetails ? '隐藏 Agent 检索路径' : '查看 Agent 检索路径'}
+                        {expandedAgentLogs[msg.id] ? '隐藏 Agent 检索路径' : '查看 Agent 检索路径'}
                       </button>
-                      {showAgentDetails && (
+                      {expandedAgentLogs[msg.id] && (
                         <ul className="space-y-1">
                           {msg.agentLogs.map((log, idx) => (
                             <li key={idx} className="text-[11px] text-slate-500 font-mono bg-slate-200/50 px-2 py-1 rounded">

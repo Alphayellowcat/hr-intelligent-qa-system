@@ -11,6 +11,41 @@ import { queueEmbedding, queueChat } from './src/server/apiQueue';
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3000', 10);
+const SESSION_TTL_MS = parseInt(process.env.SESSION_TTL_MS || `${7 * 24 * 60 * 60 * 1000}`, 10);
+const SSO_CHALLENGE_TTL_MS = 2 * 60 * 1000;
+const LOG_API_REQUESTS = process.env.LOG_API_REQUESTS !== 'false';
+
+app.disable('x-powered-by');
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  next();
+});
+app.use((req: any, res: any, next) => {
+  req.requestId = crypto.randomUUID();
+  res.setHeader('X-Request-Id', req.requestId);
+
+  if (LOG_API_REQUESTS && req.path.startsWith('/api/')) {
+    const startAt = Date.now();
+    res.on('finish', () => {
+      const log = {
+        level: 'info',
+        type: 'http_access',
+        requestId: req.requestId,
+        method: req.method,
+        path: req.originalUrl,
+        statusCode: res.statusCode,
+        durationMs: Date.now() - startAt,
+        userId: req.user?.id ?? null,
+        ip: req.ip
+      };
+      console.log(JSON.stringify(log));
+    });
+  }
+  next();
+});
 
 // Increase payload limit for large markdown files
 app.use(express.json({ limit: '50mb' }));
@@ -84,7 +119,9 @@ db.exec(`
     role TEXT,
     status TEXT DEFAULT 'active',
     display_name TEXT,
-    last_login_at DATETIME
+    last_login_at DATETIME,
+    failed_login_attempts INTEGER DEFAULT 0,
+    lock_until DATETIME
   );
   
   CREATE TABLE IF NOT EXISTS sessions (
@@ -150,6 +187,12 @@ try {
   if (!cols.some((c) => c.name === 'last_login_at')) {
     db.exec('ALTER TABLE users ADD COLUMN last_login_at DATETIME');
   }
+  if (!cols.some((c) => c.name === 'failed_login_attempts')) {
+    db.exec('ALTER TABLE users ADD COLUMN failed_login_attempts INTEGER DEFAULT 0');
+  }
+  if (!cols.some((c) => c.name === 'lock_until')) {
+    db.exec('ALTER TABLE users ADD COLUMN lock_until DATETIME');
+  }
 } catch (_) {}
 
 // Seed default users（异步，需在 initDb 中调用）
@@ -196,10 +239,17 @@ const authMiddleware = (req: any, res: any, next: any) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
   
-  const token = authHeader.split(' ')[1];
+  const [scheme, token] = authHeader.split(' ');
+  if (scheme !== 'Bearer' || !token) return res.status(401).json({ error: 'Unauthorized' });
   const session = db.prepare('SELECT * FROM sessions WHERE token = ?').get(token) as any;
   
   if (!session) return res.status(401).json({ error: 'Invalid session' });
+
+  const createdAt = new Date(session.created_at).getTime();
+  if (Number.isFinite(createdAt) && Date.now() - createdAt > SESSION_TTL_MS) {
+    db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+    return res.status(401).json({ error: 'Session expired' });
+  }
   
   const user = db.prepare('SELECT id, username, role, must_change_password, status, display_name FROM users WHERE id = ?').get(
     session.user_id
@@ -227,23 +277,53 @@ function logAudit(actorUserId: number, action: string, targetPath: string, detai
   ).run(crypto.randomUUID(), actorUserId, action, targetPath, detail);
 }
 
+function isSafePathSegment(input: string) {
+  if (!input || typeof input !== 'string') return false;
+  if (input.includes('\0') || input.includes('..') || input.includes('/') || input.includes('\\')) return false;
+  return true;
+}
+
+function isStrongPassword(password: string): boolean {
+  // 至少 10 位，包含大小写字母、数字和特殊字符
+  if (typeof password !== 'string' || password.length < 10) return false;
+  const hasUpper = /[A-Z]/.test(password);
+  const hasLower = /[a-z]/.test(password);
+  const hasDigit = /\d/.test(password);
+  const hasSpecial = /[^A-Za-z0-9]/.test(password);
+  return hasUpper && hasLower && hasDigit && hasSpecial;
+}
+
 // --- API Routes ---
 
 // Auth
 app.post('/api/auth/login', async (req, res) => {
   try {
-    const { username, password } = req.body;
+    const username = String(req.body?.username || '').trim();
+    const password = String(req.body?.password || '');
+    if (!username || !password) return res.status(400).json({ error: '用户名和密码不能为空' });
     const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username) as any;
     if (!user) return res.status(401).json({ error: '用户名或密码错误' });
     if (user.status === 'disabled') return res.status(403).json({ error: '账号已停用，请联系管理员' });
+    if (user.lock_until && new Date(user.lock_until).getTime() > Date.now()) {
+      return res.status(423).json({ error: '账号已临时锁定，请稍后再试' });
+    }
 
     const valid =
       user.password.includes(':') ? await verifyPassword(password, user.password) : false;
-    if (!valid) return res.status(401).json({ error: '用户名或密码错误' });
+    if (!valid) {
+      const attempts = Number(user.failed_login_attempts || 0) + 1;
+      if (attempts >= 5) {
+        const lockUntil = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+        db.prepare('UPDATE users SET failed_login_attempts = 0, lock_until = ? WHERE id = ?').run(lockUntil, user.id);
+      } else {
+        db.prepare('UPDATE users SET failed_login_attempts = ?, lock_until = NULL WHERE id = ?').run(attempts, user.id);
+      }
+      return res.status(401).json({ error: '用户名或密码错误' });
+    }
 
     const token = crypto.randomBytes(32).toString('hex');
     db.prepare('INSERT INTO sessions (token, user_id) VALUES (?, ?)').run(token, user.id);
-    db.prepare('UPDATE users SET last_login_at = CURRENT_TIMESTAMP WHERE id = ?').run(user.id);
+    db.prepare('UPDATE users SET last_login_at = CURRENT_TIMESTAMP, failed_login_attempts = 0, lock_until = NULL WHERE id = ?').run(user.id);
 
     res.json({
       token,
@@ -261,7 +341,8 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 app.post('/api/auth/register', async (req, res) => {
-  const { username, password } = req.body;
+  const username = String(req.body?.username || '').trim();
+  const password = String(req.body?.password || '');
   
   if (!username || !password) {
     return res.status(400).json({ error: '用户名和密码不能为空' });
@@ -275,8 +356,8 @@ app.post('/api/auth/register', async (req, res) => {
     return res.status(400).json({ error: '用户名长度必须在3到20个字符之间' });
   }
   
-  if (password.length < 6) {
-    return res.status(400).json({ error: '密码长度至少为6个字符' });
+  if (!isStrongPassword(password)) {
+    return res.status(400).json({ error: '密码强度不足：至少10位，且包含大小写字母、数字和特殊字符' });
   }
   
   const existingUser = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
@@ -312,8 +393,8 @@ app.post('/api/auth/change-password', authMiddleware, async (req: any, res) => {
     if (!currentPassword || !newPassword) {
       return res.status(400).json({ error: '当前密码和新密码不能为空' });
     }
-    if (newPassword.length < 6) {
-      return res.status(400).json({ error: '新密码长度至少为6个字符' });
+    if (!isStrongPassword(newPassword)) {
+      return res.status(400).json({ error: '新密码强度不足：至少10位，且包含大小写字母、数字和特殊字符' });
     }
 
     const user = db.prepare('SELECT password FROM users WHERE id = ?').get(req.user.id) as any;
@@ -353,7 +434,7 @@ app.post('/api/auth/sso/challenge', (req, res) => {
     return res.status(400).json({ error: '不支持的 SSO Provider' });
   }
   const id = crypto.randomUUID();
-  const expiresAt = new Date(Date.now() + 2 * 60 * 1000).toISOString();
+  const expiresAt = new Date(Date.now() + SSO_CHALLENGE_TTL_MS).toISOString();
   db.prepare('INSERT INTO sso_challenges (id, provider, status, expires_at) VALUES (?, ?, ?, ?)')
     .run(id, provider, 'pending', expiresAt);
   res.json({
@@ -479,6 +560,7 @@ app.post('/api/admin/users', authMiddleware, requireAdmin, async (req, res) => {
   const { username, password, role, displayName } = req.body || {};
   if (!username || !password) return res.status(400).json({ error: '用户名和密码不能为空' });
   if (!['admin', 'employee'].includes(role)) return res.status(400).json({ error: '角色不合法' });
+  if (!isStrongPassword(password)) return res.status(400).json({ error: '初始密码强度不足' });
   const exists = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
   if (exists) return res.status(400).json({ error: '用户名已存在' });
   const hashed = await hashPassword(password);
@@ -501,6 +583,9 @@ app.patch('/api/admin/users/:id', authMiddleware, requireAdmin, async (req: any,
   if (status) db.prepare('UPDATE users SET status = ? WHERE id = ?').run(status, id);
   if (displayName) db.prepare('UPDATE users SET display_name = ? WHERE id = ?').run(displayName, id);
   if (resetPassword) {
+    if (!isStrongPassword(resetPassword)) {
+      return res.status(400).json({ error: '重置密码强度不足' });
+    }
     const hashed = await hashPassword(resetPassword);
     db.prepare('UPDATE users SET password = ?, must_change_password = 1 WHERE id = ?').run(hashed, id);
     db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
@@ -587,6 +672,12 @@ app.get('/api/chat/threads/:id/messages', authMiddleware, (req: any, res) => {
 app.post('/api/chat/threads/:id/messages', authMiddleware, (req: any, res) => {
   const { id } = req.params;
   const { role, content, references, agentLogs } = req.body;
+  if (!['user', 'assistant'].includes(role)) {
+    return res.status(400).json({ error: 'Invalid role' });
+  }
+  if (typeof content !== 'string' || content.trim().length === 0 || content.length > 20000) {
+    return res.status(400).json({ error: 'Invalid content' });
+  }
   
   const thread = db.prepare('SELECT * FROM chat_threads WHERE id = ? AND user_id = ?').get(id, req.user.id);
   if (!thread) return res.status(404).json({ error: 'Thread not found' });
@@ -656,6 +747,10 @@ app.post('/api/docs', authMiddleware, async (req: any, res) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
     
+    if (!isSafePathSegment(folder) || !isSafePathSegment(filename) || !filename.endsWith('.md')) {
+      return res.status(400).json({ error: 'Illegal folder or filename' });
+    }
+
     const folderPath = path.join(KNOWLEDGE_DIR, folder);
     await fs.mkdir(folderPath, { recursive: true });
     
@@ -790,6 +885,33 @@ app.post('/api/semantic-search', authMiddleware, async (req: any, res) => {
   }
 });
 
+app.get('/healthz', (req, res) => {
+  res.json({
+    status: 'ok',
+    now: new Date().toISOString(),
+    uptimeSec: Math.round(process.uptime())
+  });
+});
+
+app.get('/readyz', async (req, res) => {
+  try {
+    db.prepare('SELECT 1').get();
+    const indexStatus = await vectorStore.getIndexStatus();
+    res.json({
+      status: 'ready',
+      checks: {
+        db: 'ok',
+        vectorIndex: indexStatus?.tableExists && indexStatus.chunkCount > 0 ? 'ok' : 'degraded'
+      }
+    });
+  } catch (err) {
+    res.status(503).json({
+      status: 'not-ready',
+      checks: { db: 'error' }
+    });
+  }
+});
+
 export async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
@@ -812,6 +934,10 @@ export async function startServer() {
 
 async function init() {
   await seedUsers();
+  setInterval(() => {
+    db.prepare("DELETE FROM sessions WHERE datetime(created_at) <= datetime('now', ?)").run(`-${Math.floor(SESSION_TTL_MS / 1000)} seconds`);
+    db.prepare("DELETE FROM sso_challenges WHERE datetime(expires_at) <= datetime('now')").run();
+  }, 10 * 60 * 1000).unref();
   await startServer();
 }
 init();

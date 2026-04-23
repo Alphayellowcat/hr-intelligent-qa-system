@@ -327,7 +327,7 @@ export default function App() {
                     </div>
                     <button
                       onClick={(e) => handleDeleteThread(e, thread.id)}
-                      className="p-1 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded opacity-0 group-hover:opacity-100 transition-all"
+                      className="p-1 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded opacity-100 lg:opacity-0 lg:group-hover:opacity-100 transition-all"
                       title="删除对话"
                     >
                       <Trash2 size={14} />
