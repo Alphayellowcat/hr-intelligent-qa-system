@@ -81,7 +81,10 @@ db.exec(`
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT UNIQUE,
     password TEXT,
-    role TEXT
+    role TEXT,
+    status TEXT DEFAULT 'active',
+    display_name TEXT,
+    last_login_at DATETIME
   );
   
   CREATE TABLE IF NOT EXISTS sessions (
@@ -112,6 +115,24 @@ db.exec(`
     key TEXT PRIMARY KEY,
     value TEXT
   );
+
+  CREATE TABLE IF NOT EXISTS audit_logs (
+    id TEXT PRIMARY KEY,
+    actor_user_id INTEGER,
+    action TEXT,
+    target_path TEXT,
+    detail TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS sso_challenges (
+    id TEXT PRIMARY KEY,
+    provider TEXT,
+    status TEXT,
+    username TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    expires_at DATETIME
+  );
 `);
 
 // 迁移：添加 must_change_password 列（若不存在）
@@ -119,6 +140,15 @@ try {
   const cols = db.prepare('PRAGMA table_info(users)').all() as { name: string }[];
   if (!cols.some((c) => c.name === 'must_change_password')) {
     db.exec('ALTER TABLE users ADD COLUMN must_change_password INTEGER DEFAULT 0');
+  }
+  if (!cols.some((c) => c.name === 'status')) {
+    db.exec("ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'active'");
+  }
+  if (!cols.some((c) => c.name === 'display_name')) {
+    db.exec('ALTER TABLE users ADD COLUMN display_name TEXT');
+  }
+  if (!cols.some((c) => c.name === 'last_login_at')) {
+    db.exec('ALTER TABLE users ADD COLUMN last_login_at DATETIME');
   }
 } catch (_) {}
 
@@ -171,18 +201,31 @@ const authMiddleware = (req: any, res: any, next: any) => {
   
   if (!session) return res.status(401).json({ error: 'Invalid session' });
   
-  const user = db.prepare('SELECT id, username, role, must_change_password FROM users WHERE id = ?').get(
+  const user = db.prepare('SELECT id, username, role, must_change_password, status, display_name FROM users WHERE id = ?').get(
     session.user_id
   ) as any;
   if (!user) return res.status(401).json({ error: 'User not found' });
+  if (user.status === 'disabled') return res.status(403).json({ error: '账号已停用，请联系管理员' });
   
   req.user = {
     ...user,
-    mustChangePassword: !!user.must_change_password
+    mustChangePassword: !!user.must_change_password,
+    displayName: user.display_name || user.username
   };
   req.token = token;
   next();
 };
+
+const requireAdmin = (req: any, res: any, next: any) => {
+  if (req.user?.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
+  next();
+};
+
+function logAudit(actorUserId: number, action: string, targetPath: string, detail: string) {
+  db.prepare(
+    'INSERT INTO audit_logs (id, actor_user_id, action, target_path, detail) VALUES (?, ?, ?, ?, ?)'
+  ).run(crypto.randomUUID(), actorUserId, action, targetPath, detail);
+}
 
 // --- API Routes ---
 
@@ -192,6 +235,7 @@ app.post('/api/auth/login', async (req, res) => {
     const { username, password } = req.body;
     const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username) as any;
     if (!user) return res.status(401).json({ error: '用户名或密码错误' });
+    if (user.status === 'disabled') return res.status(403).json({ error: '账号已停用，请联系管理员' });
 
     const valid =
       user.password.includes(':') ? await verifyPassword(password, user.password) : false;
@@ -199,12 +243,14 @@ app.post('/api/auth/login', async (req, res) => {
 
     const token = crypto.randomBytes(32).toString('hex');
     db.prepare('INSERT INTO sessions (token, user_id) VALUES (?, ?)').run(token, user.id);
+    db.prepare('UPDATE users SET last_login_at = CURRENT_TIMESTAMP WHERE id = ?').run(user.id);
 
     res.json({
       token,
       user: {
         id: user.id,
         username: user.username,
+        displayName: user.display_name || user.username,
         role: user.role,
         mustChangePassword: !!user.must_change_password
       }
@@ -241,14 +287,15 @@ app.post('/api/auth/register', async (req, res) => {
   try {
     const hashed = await hashPassword(password);
     const result = db
-      .prepare('INSERT INTO users (username, password, role, must_change_password) VALUES (?, ?, ?, ?)')
-      .run(username, hashed, 'employee', 0);
+      .prepare('INSERT INTO users (username, password, role, must_change_password, status, display_name) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(username, hashed, 'employee', 0, 'active', username);
     const userId = result.lastInsertRowid;
 
     const token = crypto.randomBytes(32).toString('hex');
     db.prepare('INSERT INTO sessions (token, user_id) VALUES (?, ?)').run(token, userId);
+    db.prepare('UPDATE users SET last_login_at = CURRENT_TIMESTAMP WHERE id = ?').run(userId);
 
-    res.json({ token, user: { id: userId, username, role: 'employee', mustChangePassword: false } });
+    res.json({ token, user: { id: userId, username, displayName: username, role: 'employee', mustChangePassword: false } });
   } catch (err) {
     res.status(500).json({ error: '注册失败，请稍后再试' });
   }
@@ -291,6 +338,89 @@ app.get('/api/auth/me', authMiddleware, (req: any, res) => {
   res.json({ user: req.user });
 });
 
+app.get('/api/auth/sso/providers', (req, res) => {
+  res.json({
+    providers: [
+      { id: 'wechat', name: '微信', enabled: true },
+      { id: 'feishu', name: '飞书', enabled: true }
+    ]
+  });
+});
+
+app.post('/api/auth/sso/challenge', (req, res) => {
+  const { provider } = req.body || {};
+  if (!['wechat', 'feishu'].includes(provider)) {
+    return res.status(400).json({ error: '不支持的 SSO Provider' });
+  }
+  const id = crypto.randomUUID();
+  const expiresAt = new Date(Date.now() + 2 * 60 * 1000).toISOString();
+  db.prepare('INSERT INTO sso_challenges (id, provider, status, expires_at) VALUES (?, ?, ?, ?)')
+    .run(id, provider, 'pending', expiresAt);
+  res.json({
+    challengeId: id,
+    provider,
+    expiresAt,
+    qrPayload: `hrqa://sso/${provider}?challenge=${id}`
+  });
+});
+
+app.get('/api/auth/sso/challenge/:id', (req, res) => {
+  const row = db
+    .prepare('SELECT id, provider, status, username, expires_at FROM sso_challenges WHERE id = ?')
+    .get(req.params.id) as any;
+  if (!row) return res.status(404).json({ error: '挑战不存在' });
+  if (new Date(row.expires_at).getTime() < Date.now() && row.status === 'pending') {
+    db.prepare('UPDATE sso_challenges SET status = ? WHERE id = ?').run('expired', row.id);
+    row.status = 'expired';
+  }
+  if (row.status !== 'approved') {
+    return res.json({ status: row.status, provider: row.provider, username: row.username || null });
+  }
+
+  const user = db.prepare('SELECT * FROM users WHERE username = ?').get(row.username) as any;
+  if (!user || user.status === 'disabled') {
+    return res.status(403).json({ error: 'SSO 用户不可用' });
+  }
+  const token = crypto.randomBytes(32).toString('hex');
+  db.prepare('INSERT INTO sessions (token, user_id) VALUES (?, ?)').run(token, user.id);
+  db.prepare('UPDATE users SET last_login_at = CURRENT_TIMESTAMP WHERE id = ?').run(user.id);
+  db.prepare('UPDATE sso_challenges SET status = ? WHERE id = ?').run('completed', row.id);
+  return res.json({
+    status: 'approved',
+    token,
+    user: {
+      id: user.id,
+      username: user.username,
+      displayName: user.display_name || user.username,
+      role: user.role,
+      mustChangePassword: !!user.must_change_password
+    }
+  });
+});
+
+// Demo 模拟扫码回调（生产环境请替换为微信/飞书官方回调）
+app.post('/api/auth/sso/mock/complete', (req, res) => {
+  const { challengeId, username } = req.body || {};
+  if (!challengeId || !username) return res.status(400).json({ error: '参数不完整' });
+  const challenge = db.prepare('SELECT * FROM sso_challenges WHERE id = ?').get(challengeId) as any;
+  if (!challenge) return res.status(404).json({ error: '挑战不存在' });
+  if (challenge.status !== 'pending') return res.status(400).json({ error: '挑战状态不可用' });
+
+  let user = db.prepare('SELECT * FROM users WHERE username = ?').get(username) as any;
+  if (!user) {
+    const randomPw = crypto.randomBytes(12).toString('hex');
+    hashPassword(randomPw).then((hashed) => {
+      db.prepare('INSERT INTO users (username, password, role, must_change_password, status, display_name) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(username, hashed, 'employee', 0, 'active', username);
+      db.prepare('UPDATE sso_challenges SET status = ?, username = ? WHERE id = ?').run('approved', username, challengeId);
+      res.json({ success: true, username });
+    }).catch(() => res.status(500).json({ error: '创建用户失败' }));
+    return;
+  }
+  db.prepare('UPDATE sso_challenges SET status = ?, username = ? WHERE id = ?').run('approved', username, challengeId);
+  return res.json({ success: true, username: user.username });
+});
+
 // Settings
 app.get('/api/settings', authMiddleware, (req: any, res) => {
   const rows = db.prepare('SELECT * FROM settings').all() as any[];
@@ -307,9 +437,7 @@ app.get('/api/settings', authMiddleware, (req: any, res) => {
   res.json(settings);
 });
 
-app.post('/api/settings', authMiddleware, (req: any, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
-  
+app.post('/api/settings', authMiddleware, requireAdmin, (req: any, res) => {
   const updates = req.body;
   const stmt = db.prepare('UPDATE settings SET value = ? WHERE key = ?');
   const insertStmt = db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)');
@@ -326,9 +454,7 @@ app.post('/api/settings', authMiddleware, (req: any, res) => {
   res.json({ success: true });
 });
 
-app.post('/api/models', authMiddleware, async (req: any, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
-  
+app.post('/api/models', authMiddleware, requireAdmin, async (req: any, res) => {
   const { api_url, api_key } = req.body;
   try {
     const response = await fetch(`${api_url}/models`, {
@@ -339,6 +465,48 @@ app.post('/api/models', authMiddleware, async (req: any, res) => {
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// Admin - User management
+app.get('/api/admin/users', authMiddleware, requireAdmin, (req, res) => {
+  const users = db.prepare(
+    'SELECT id, username, role, status, display_name, must_change_password, last_login_at FROM users ORDER BY id ASC'
+  ).all();
+  res.json(users);
+});
+
+app.post('/api/admin/users', authMiddleware, requireAdmin, async (req, res) => {
+  const { username, password, role, displayName } = req.body || {};
+  if (!username || !password) return res.status(400).json({ error: '用户名和密码不能为空' });
+  if (!['admin', 'employee'].includes(role)) return res.status(400).json({ error: '角色不合法' });
+  const exists = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
+  if (exists) return res.status(400).json({ error: '用户名已存在' });
+  const hashed = await hashPassword(password);
+  const result = db.prepare(
+    'INSERT INTO users (username, password, role, status, display_name, must_change_password) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(username, hashed, role, 'active', displayName || username, 1);
+  logAudit((req as any).user.id, 'user.create', `/users/${username}`, `role=${role}`);
+  res.json({ id: result.lastInsertRowid });
+});
+
+app.patch('/api/admin/users/:id', authMiddleware, requireAdmin, async (req: any, res) => {
+  const { id } = req.params;
+  const { role, status, resetPassword, displayName } = req.body || {};
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(id) as any;
+  if (!user) return res.status(404).json({ error: '用户不存在' });
+  if (role && !['admin', 'employee'].includes(role)) return res.status(400).json({ error: '角色不合法' });
+  if (status && !['active', 'disabled'].includes(status)) return res.status(400).json({ error: '状态不合法' });
+
+  if (role) db.prepare('UPDATE users SET role = ? WHERE id = ?').run(role, id);
+  if (status) db.prepare('UPDATE users SET status = ? WHERE id = ?').run(status, id);
+  if (displayName) db.prepare('UPDATE users SET display_name = ? WHERE id = ?').run(displayName, id);
+  if (resetPassword) {
+    const hashed = await hashPassword(resetPassword);
+    db.prepare('UPDATE users SET password = ?, must_change_password = 1 WHERE id = ?').run(hashed, id);
+    db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
+  }
+  logAudit(req.user.id, 'user.update', `/users/${user.username}`, JSON.stringify({ role, status, resetPassword: !!resetPassword, displayName }));
+  res.json({ success: true });
 });
 
 // OpenAI Proxy（经队列限流，避免外部 API 429）
@@ -480,9 +648,7 @@ app.get('/api/docs', authMiddleware, async (req, res) => {
 });
 
 app.post('/api/docs', authMiddleware, async (req: any, res) => {
-  if (req.user.role !== 'admin') {
-    return res.status(403).json({ error: 'Forbidden: Admins only' });
-  }
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Forbidden: Admins only' });
 
   try {
     const { folder, filename, content } = req.body;
@@ -494,7 +660,16 @@ app.post('/api/docs', authMiddleware, async (req: any, res) => {
     await fs.mkdir(folderPath, { recursive: true });
     
     const filePath = path.join(folderPath, filename);
+    let previous = '';
+    try {
+      previous = await fs.readFile(filePath, 'utf-8');
+    } catch {}
     await fs.writeFile(filePath, content, 'utf-8');
+    const action = previous ? 'doc.update' : 'doc.create';
+    logAudit(req.user.id, action, `/${folder}/${filename}`, JSON.stringify({
+      previousLength: previous.length,
+      newLength: typeof content === 'string' ? content.length : 0
+    }));
     
     res.json({ success: true });
     triggerKnowledgeIndex();
@@ -502,6 +677,18 @@ app.post('/api/docs', authMiddleware, async (req: any, res) => {
     console.error('Error saving doc:', error);
     res.status(500).json({ error: String(error) });
   }
+});
+
+app.get('/api/docs/audit', authMiddleware, requireAdmin, (req, res) => {
+  const limit = Math.min(parseInt((req.query.limit as string) || '50', 10), 200);
+  const rows = db.prepare(`
+    SELECT a.id, a.action, a.target_path, a.detail, a.created_at, u.username AS actor
+    FROM audit_logs a
+    LEFT JOIN users u ON u.id = a.actor_user_id
+    ORDER BY a.created_at DESC
+    LIMIT ?
+  `).all(limit);
+  res.json(rows);
 });
 
 // --- 向量索引 API ---

@@ -33,12 +33,17 @@ export function AdminPanel({ knowledgeBase, onDocsChange }: AdminPanelProps) {
   const [error, setError] = useState<string | null>(null);
   const [indexStatus, setIndexStatus] = useState<{ chunkCount: number } | null>(null);
   const [isIndexing, setIsIndexing] = useState(false);
+  const [auditLogs, setAuditLogs] = useState<any[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const fetchIndexStatus = () => {
     apiFetch('/api/index/status').then(setIndexStatus).catch(() => setIndexStatus(null));
   };
+  const fetchAuditLogs = () => {
+    apiFetch('/api/docs/audit?limit=20').then(setAuditLogs).catch(() => setAuditLogs([]));
+  };
   useEffect(() => { fetchIndexStatus(); }, []);
+  useEffect(() => { fetchAuditLogs(); }, []);
 
   const handleTriggerIndex = async () => {
     setIsIndexing(true);
@@ -92,6 +97,7 @@ export function AdminPanel({ knowledgeBase, onDocsChange }: AdminPanelProps) {
         body: JSON.stringify({ folder, filename, content })
       });
       onDocsChange(); // Refresh the tree
+      fetchAuditLogs();
     } catch (err) {
       console.error(err);
       setError(err instanceof Error ? err.message : 'Failed to save file');
@@ -202,6 +208,7 @@ Return ONLY the raw Markdown content for the 'content' field.`;
   const handleAcceptAI = async () => {
     if (!proposedAction) return;
     await handleSaveFile(proposedAction.folder, proposedAction.filename, proposedAction.content);
+    fetchAuditLogs();
     
     // If it was a new file, we should ideally select it, but for now we just reset
     if (proposedAction.intent === 'CREATE') {
@@ -264,6 +271,30 @@ Return ONLY the raw Markdown content for the 'content' field.`;
             {indexStatus?.chunkCount != null && indexStatus.chunkCount > 0 && (
               <span className="text-xs text-slate-500">{indexStatus.chunkCount} 段</span>
             )}
+          </div>
+        </div>
+        <div className="p-3 border-b border-slate-200 bg-white">
+          <div className="flex items-center justify-between mb-2">
+            <p className="text-xs text-slate-500 font-semibold">最近文档变更</p>
+            <button
+              onClick={fetchAuditLogs}
+              className="text-[11px] text-indigo-600 hover:text-indigo-700"
+            >
+              刷新
+            </button>
+          </div>
+          <div className="space-y-1 max-h-40 overflow-y-auto pr-1">
+            {auditLogs.slice(0, 6).map((log) => (
+              <div key={log.id} className="text-[11px] text-slate-600 bg-slate-50 rounded p-1.5">
+                <div className="font-medium">
+                  <span className="inline-block px-1.5 py-0.5 rounded bg-white border border-slate-200 mr-1">{log.action}</span>
+                  {log.actor || 'unknown'}
+                </div>
+                <div className="truncate text-slate-500">{log.target_path}</div>
+                <div className="text-slate-400">{new Date(log.created_at).toLocaleString()}</div>
+              </div>
+            ))}
+            {auditLogs.length === 0 && <p className="text-[11px] text-slate-400">暂无变更记录</p>}
           </div>
         </div>
         <div className="flex-1 overflow-y-auto p-3 space-y-4">

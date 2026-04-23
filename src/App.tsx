@@ -11,13 +11,15 @@ import {
   LogOut,
   PlusCircle,
   MessageCircle,
-  Trash2
+  Trash2,
+  Users
 } from 'lucide-react';
 import { Chat } from './components/Chat';
 import { AdminPanel } from './components/AdminPanel';
 import { Login } from './components/Login';
 import { Settings } from './components/Settings';
 import { ChangePasswordModal } from './components/ChangePasswordModal';
+import { UserManagement } from './components/UserManagement';
 import { cn } from './lib/utils';
 import { apiFetch, removeToken, getToken } from './api';
 
@@ -96,7 +98,7 @@ export default function App() {
   
   const [activeModule, setActiveModule] = useState(MODULES[0]);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
-  const [currentView, setCurrentView] = useState<'chat' | 'admin' | 'settings'>('chat');
+  const [currentView, setCurrentView] = useState<'chat' | 'admin' | 'settings' | 'users'>('chat');
   const [knowledgeBase, setKnowledgeBase] = useState<DocFolder[]>([]);
   const [isLoadingDocs, setIsLoadingDocs] = useState(false);
   
@@ -371,6 +373,33 @@ export default function App() {
                 </button>
                 <button
                   onClick={() => {
+                    setCurrentView('users');
+                    setCurrentThreadId(null);
+                    if (window.innerWidth < 1024) setIsSidebarOpen(false);
+                  }}
+                  className={cn(
+                    "w-full flex items-start gap-3 px-3 py-3 rounded-xl text-left transition-all duration-200",
+                    currentView === 'users'
+                      ? "bg-purple-50 text-purple-700 shadow-sm ring-1 ring-purple-100"
+                      : "text-slate-600 hover:bg-slate-50 hover:text-slate-900"
+                  )}
+                >
+                  <Users className={cn(
+                    "shrink-0 mt-0.5",
+                    currentView === 'users' ? "text-purple-600" : "text-slate-400"
+                  )} size={20} />
+                  <div>
+                    <div className="font-medium text-sm">用户权限管理</div>
+                    <div className={cn(
+                      "text-xs mt-0.5 line-clamp-2",
+                      currentView === 'users' ? "text-purple-500" : "text-slate-400"
+                    )}>
+                      多用户、角色、停用与重置密码
+                    </div>
+                  </div>
+                </button>
+                <button
+                  onClick={() => {
                     setCurrentView('settings');
                     setCurrentThreadId(null);
                     if (window.innerWidth < 1024) setIsSidebarOpen(false);
@@ -437,7 +466,19 @@ export default function App() {
         </header>
 
         <div className="flex-1 p-4 lg:p-8 overflow-hidden">
-          <div className="max-w-5xl mx-auto h-full">
+          <div className="max-w-5xl mx-auto h-full flex flex-col gap-3">
+            <div className="hidden lg:flex items-center justify-between px-1">
+              <div>
+                <p className="text-xs text-slate-500 uppercase tracking-wide">Workspace</p>
+                <h2 className="text-base font-semibold text-slate-800">
+                  {currentView === 'chat' ? activeModule.title : currentView === 'admin' ? '知识库管理' : currentView === 'users' ? '用户权限管理' : '模型设置'}
+                </h2>
+              </div>
+              <div className="text-xs text-slate-500 bg-white border border-slate-200 rounded-lg px-2 py-1">
+                当前用户：{user.displayName || user.username}（{user.role === 'admin' ? '管理员' : '员工'}）
+              </div>
+            </div>
+            <div className="flex-1 min-h-0">
             {isLoadingDocs ? (
               <div className="flex items-center justify-center h-full text-slate-500">加载知识库中...</div>
             ) : currentView === 'admin' ? (
@@ -447,6 +488,8 @@ export default function App() {
               />
             ) : currentView === 'settings' ? (
               <Settings />
+            ) : currentView === 'users' ? (
+              <UserManagement />
             ) : (
               <Chat 
                 mode={activeModule.title} 
@@ -459,8 +502,10 @@ export default function App() {
                   setCurrentThreadId(id);
                   fetchThreads();
                 }}
+                onStartNewChat={createNewChat}
               />
             )}
+            </div>
           </div>
         </div>
       </main>
