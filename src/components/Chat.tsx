@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Send, User, Bot, Loader2, AlertCircle, FileSearch, FolderTree } from 'lucide-react';
+import { Send, User, Bot, Loader2, AlertCircle, FileSearch, FolderTree, RotateCcw, Sparkles } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { cn } from '../lib/utils';
@@ -23,15 +23,26 @@ interface ChatProps {
   knowledgeBase: DocFolder[];
   threadId: string | null;
   onThreadCreated: (id: string) => void;
+  onStartNewChat: () => void;
 }
 
-export function Chat({ mode, modeId, systemPrompt, welcomeMessage, knowledgeBase, threadId, onThreadCreated }: ChatProps) {
+const STARTER_PROMPTS: Record<string, string[]> = {
+  qa: ['我这个月的加班费怎么算？', '请帮我梳理请年假的流程和审批节点', '试用期内社保从什么时候开始缴纳？'],
+  onboarding: ['新员工第一周我需要完成哪些事项？', '医院考勤打卡与迟到规则是怎样的？', '入职后常见系统账号开通流程是什么？'],
+  policy: ['请把职称评审政策用 5 条讲清楚', '绩效考核政策中最容易忽略的注意点有哪些？', '休假制度适用对象和限制条件分别是什么？'],
+  career: ['我现在是住院医，3 年内怎么规划晋升？', '如何制定可执行的季度能力提升计划？', '想走管理岗，需要重点补哪些能力？'],
+  compliance: ['拟定调岗降薪方案时有哪些法律风险？', '解除劳动合同前应该先完成哪些合规动作？', '排班加班制度怎么设计更合规？']
+};
+
+export function Chat({ mode, modeId, systemPrompt, welcomeMessage, knowledgeBase, threadId, onThreadCreated, onStartNewChat }: ChatProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [agentStatus, setAgentStatus] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
+  const [showAgentDetails, setShowAgentDetails] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   // Reset chat when mode or thread changes
   useEffect(() => {
@@ -55,6 +66,7 @@ export function Chat({ mode, modeId, systemPrompt, welcomeMessage, knowledgeBase
     loadThread();
     setError(null);
     setInput('');
+    setShowAgentDetails(false);
   }, [mode, welcomeMessage, threadId]);
 
   const scrollToBottom = () => {
@@ -64,6 +76,17 @@ export function Chat({ mode, modeId, systemPrompt, welcomeMessage, knowledgeBase
   useEffect(() => {
     scrollToBottom();
   }, [messages, agentStatus]);
+
+  const autoResizeInput = () => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${Math.min(el.scrollHeight, 140)}px`;
+  };
+
+  useEffect(() => {
+    autoResizeInput();
+  }, [input]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -420,12 +443,38 @@ CRITICAL - Final Answer Requirement:
     }
   };
 
+  const handleInputKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSubmit(e as unknown as React.FormEvent);
+    }
+  };
+
+  const handleQuickPrompt = (prompt: string) => {
+    setInput(prompt);
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  };
+
+  const isFreshConversation = !threadId && messages.length <= 1;
+  const starterPrompts = STARTER_PROMPTS[modeId] || STARTER_PROMPTS.qa;
+
   return (
     <div className="flex flex-col h-full bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
       {/* Header */}
       <div className="px-6 py-4 border-b border-slate-100 bg-slate-50/50">
-        <h2 className="text-lg font-semibold text-slate-800">{mode}</h2>
-        <p className="text-sm text-slate-500">AI-powered HR Assistant (Agentic Retrieval)</p>
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h2 className="text-lg font-semibold text-slate-800">{mode}</h2>
+            <p className="text-sm text-slate-500">AI-powered HR Assistant (Agentic Retrieval)</p>
+          </div>
+          <button
+            onClick={onStartNewChat}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border border-slate-200 text-slate-600 hover:bg-white"
+          >
+            <RotateCcw size={14} />
+            重新开始
+          </button>
+        </div>
       </div>
 
       {/* Messages */}
@@ -462,17 +511,22 @@ CRITICAL - Final Answer Requirement:
                   
                   {msg.agentLogs && msg.agentLogs.length > 0 && (
                     <div className="mt-3 pt-3 border-t border-slate-200/60">
-                      <p className="text-xs text-slate-500 flex items-center gap-1.5 font-medium mb-1.5">
+                      <button
+                        onClick={() => setShowAgentDetails((prev) => !prev)}
+                        className="text-xs text-slate-500 flex items-center gap-1.5 font-medium mb-1.5 hover:text-slate-700"
+                      >
                         <FolderTree size={14} className="text-indigo-500" />
-                        Agent 检索路径：
-                      </p>
-                      <ul className="space-y-1">
-                        {msg.agentLogs.map((log, idx) => (
-                          <li key={idx} className="text-[11px] text-slate-500 font-mono bg-slate-200/50 px-2 py-1 rounded">
-                            &gt; {log}
-                          </li>
-                        ))}
-                      </ul>
+                        {showAgentDetails ? '隐藏 Agent 检索路径' : '查看 Agent 检索路径'}
+                      </button>
+                      {showAgentDetails && (
+                        <ul className="space-y-1">
+                          {msg.agentLogs.map((log, idx) => (
+                            <li key={idx} className="text-[11px] text-slate-500 font-mono bg-slate-200/50 px-2 py-1 rounded">
+                              &gt; {log}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
                     </div>
                   )}
 
@@ -520,13 +574,35 @@ CRITICAL - Final Answer Requirement:
 
       {/* Input */}
       <div className="p-4 bg-white border-t border-slate-100">
+        {isFreshConversation && (
+          <div className="mb-3">
+            <p className="text-xs text-slate-500 mb-2 flex items-center gap-1.5">
+              <Sparkles size={14} className="text-amber-500" />
+              推荐你这样提问（点击即填入）：
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {starterPrompts.map((prompt) => (
+                <button
+                  key={prompt}
+                  type="button"
+                  onClick={() => handleQuickPrompt(prompt)}
+                  className="text-xs px-2.5 py-1.5 rounded-lg bg-slate-100 text-slate-600 hover:bg-indigo-50 hover:text-indigo-700 transition-colors"
+                >
+                  {prompt}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
         <form onSubmit={handleSubmit} className="relative flex items-center">
-          <input
-            type="text"
+          <textarea
+            ref={textareaRef}
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder="输入您的问题..."
-            className="w-full pl-4 pr-12 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all"
+            onKeyDown={handleInputKeyDown}
+            rows={1}
+            placeholder="输入您的问题...（Enter 发送，Shift+Enter 换行）"
+            className="w-full pl-4 pr-12 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all resize-none"
             disabled={isLoading}
           />
           <button
@@ -544,4 +620,3 @@ CRITICAL - Final Answer Requirement:
     </div>
   );
 }
-
