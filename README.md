@@ -79,6 +79,25 @@
 - 提供后端 SSO challenge + 状态轮询接口，便于接入企业微信/飞书官方 OAuth。
 - 当前仓库默认提供 `mock/complete` 接口做本地联调演示；生产环境请替换为官方回调并做签名校验。
 
+### 2.1 第三方登录接入（Google / 企业微信 / 飞书）去哪注册、拿什么
+- **Google OAuth**
+  - 注册入口：Google Cloud Console → APIs & Services → Credentials（创建 OAuth Client）。  
+  - 你需要拿到：`Client ID`、`Client Secret`、`Authorized redirect URI`。
+- **企业微信（WeCom）**
+  - 注册入口：企业微信管理后台（企业已认证后开通开发者接口）。  
+  - 你需要拿到：企业 `CorpID`、应用 `AgentID`、应用 `Secret`，以及网页授权回调域名/URL。
+- **飞书（Lark/Feishu）**
+  - 注册入口：飞书开放平台（创建企业自建应用）。  
+  - 你需要拿到：`App ID`、`App Secret`、重定向回调地址（Redirect URI）。
+
+> 建议：先在各平台配置测试回调地址（如 `https://your-domain/api/auth/sso/callback/<provider>`），打通后再切生产域名。
+
+#### Google 首次打通最小步骤（本仓库已实现）
+1. 在 Google Cloud Console 创建 OAuth Client（Web application）。  
+2. 添加回调地址：`<SSO_REDIRECT_BASE_URL>/api/auth/sso/callback/google`。  
+3. 在服务端配置：`GOOGLE_CLIENT_ID`、`GOOGLE_CLIENT_SECRET`、`SSO_REDIRECT_BASE_URL`。  
+4. 登录页选择 Google 授权后，系统会创建 challenge，打开 Google 授权窗口，授权成功后回写 challenge，前端轮询自动完成登录。  
+
 ### 3) 知识库文档维护与审计
 - 文档保存（新建/修改）将自动记录审计日志（操作人、动作、目标文件、时间）。
 - 管理后台新增最近文档变更列表，便于快速追踪谁在何时修改了什么。

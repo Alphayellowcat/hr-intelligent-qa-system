@@ -170,6 +170,15 @@ db.exec(`
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     expires_at DATETIME
   );
+
+  CREATE TABLE IF NOT EXISTS sso_identities (
+    id TEXT PRIMARY KEY,
+    provider TEXT,
+    provider_user_id TEXT,
+    user_id INTEGER,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(provider, provider_user_id)
+  );
 `);
 
 // 迁移：添加 must_change_password 列（若不存在）
@@ -291,6 +300,11 @@ function isStrongPassword(password: string): boolean {
   const hasDigit = /\d/.test(password);
   const hasSpecial = /[^A-Za-z0-9]/.test(password);
   return hasUpper && hasLower && hasDigit && hasSpecial;
+}
+
+function makeSystemPassword() {
+  // 生成满足强密码策略的系统随机密码
+  return `Aa1!${crypto.randomBytes(16).toString('hex')}`;
 }
 
 // --- API Routes ---
@@ -420,8 +434,10 @@ app.get('/api/auth/me', authMiddleware, (req: any, res) => {
 });
 
 app.get('/api/auth/sso/providers', (req, res) => {
+  const googleEnabled = !!process.env.GOOGLE_CLIENT_ID && !!process.env.GOOGLE_CLIENT_SECRET;
   res.json({
     providers: [
+      { id: 'google', name: 'Google', enabled: googleEnabled },
       { id: 'wechat', name: '微信', enabled: true },
       { id: 'feishu', name: '飞书', enabled: true }
     ]
@@ -430,7 +446,7 @@ app.get('/api/auth/sso/providers', (req, res) => {
 
 app.post('/api/auth/sso/challenge', (req, res) => {
   const { provider } = req.body || {};
-  if (!['wechat', 'feishu'].includes(provider)) {
+  if (!['google', 'wechat', 'feishu'].includes(provider)) {
     return res.status(400).json({ error: '不支持的 SSO Provider' });
   }
   const id = crypto.randomUUID();
@@ -443,6 +459,119 @@ app.post('/api/auth/sso/challenge', (req, res) => {
     expiresAt,
     qrPayload: `hrqa://sso/${provider}?challenge=${id}`
   });
+});
+
+app.post('/api/auth/sso/google/start', (req, res) => {
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  const baseUrl = process.env.SSO_REDIRECT_BASE_URL || `${req.protocol}://${req.get('host')}`;
+  if (!clientId || !clientSecret) {
+    return res.status(503).json({ error: 'Google SSO 未配置（缺少 GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET）' });
+  }
+
+  const challengeId = crypto.randomUUID();
+  const expiresAt = new Date(Date.now() + SSO_CHALLENGE_TTL_MS).toISOString();
+  db.prepare('INSERT INTO sso_challenges (id, provider, status, expires_at) VALUES (?, ?, ?, ?)')
+    .run(challengeId, 'google', 'pending', expiresAt);
+
+  const redirectUri = `${baseUrl}/api/auth/sso/callback/google`;
+  const params = new URLSearchParams({
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    response_type: 'code',
+    scope: 'openid email profile',
+    state: challengeId,
+    prompt: 'select_account'
+  });
+
+  res.json({
+    challengeId,
+    expiresAt,
+    authUrl: `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`
+  });
+});
+
+app.get('/api/auth/sso/callback/google', async (req, res) => {
+  const code = String(req.query.code || '');
+  const state = String(req.query.state || '');
+  if (!code || !state) return res.status(400).send('Missing code/state');
+
+  const challenge = db.prepare('SELECT * FROM sso_challenges WHERE id = ?').get(state) as any;
+  if (!challenge || challenge.provider !== 'google') return res.status(400).send('Invalid challenge');
+  if (challenge.status !== 'pending') return res.status(400).send('Challenge already used/expired');
+  if (new Date(challenge.expires_at).getTime() < Date.now()) {
+    db.prepare('UPDATE sso_challenges SET status = ? WHERE id = ?').run('expired', state);
+    return res.status(400).send('Challenge expired');
+  }
+
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  const baseUrl = process.env.SSO_REDIRECT_BASE_URL || `${req.protocol}://${req.get('host')}`;
+  const redirectUri = `${baseUrl}/api/auth/sso/callback/google`;
+  if (!clientId || !clientSecret) return res.status(503).send('Google SSO is not configured');
+
+  try {
+    const tokenResp = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code,
+        client_id: clientId,
+        client_secret: clientSecret,
+        redirect_uri: redirectUri,
+        grant_type: 'authorization_code'
+      }).toString()
+    });
+    if (!tokenResp.ok) return res.status(502).send('Google token exchange failed');
+    const tokenData = await tokenResp.json() as any;
+    if (!tokenData.access_token) return res.status(502).send('Missing Google access token');
+
+    const userResp = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` }
+    });
+    if (!userResp.ok) return res.status(502).send('Google userinfo request failed');
+    const profile = await userResp.json() as any;
+    const providerUserId = String(profile.sub || '');
+    if (!providerUserId) return res.status(502).send('Google profile missing subject');
+
+    let userId: number | null = null;
+    const existingIdentity = db.prepare(
+      'SELECT user_id FROM sso_identities WHERE provider = ? AND provider_user_id = ?'
+    ).get('google', providerUserId) as any;
+    if (existingIdentity?.user_id) {
+      userId = Number(existingIdentity.user_id);
+    } else {
+      const preferredUsername = String(profile.email || `google_${providerUserId}`);
+      const existingUser = db.prepare('SELECT id FROM users WHERE username = ?').get(preferredUsername) as any;
+      if (existingUser?.id) {
+        userId = Number(existingUser.id);
+      } else {
+        const randomPw = makeSystemPassword();
+        const hashed = await hashPassword(randomPw);
+        const created = db.prepare(
+          'INSERT INTO users (username, password, role, must_change_password, status, display_name) VALUES (?, ?, ?, ?, ?, ?)'
+        ).run(preferredUsername, hashed, 'employee', 0, 'active', profile.name || preferredUsername);
+        userId = Number(created.lastInsertRowid);
+      }
+      db.prepare(
+        'INSERT OR IGNORE INTO sso_identities (id, provider, provider_user_id, user_id) VALUES (?, ?, ?, ?)'
+      ).run(crypto.randomUUID(), 'google', providerUserId, userId);
+    }
+
+    const user = db.prepare('SELECT username FROM users WHERE id = ?').get(userId) as any;
+    if (!user) return res.status(500).send('User binding failed');
+    db.prepare('UPDATE sso_challenges SET status = ?, username = ? WHERE id = ?').run('approved', user.username, state);
+    return res.type('html').send(`
+      <html><body style="font-family: sans-serif; padding: 24px;">
+      <h3>Google 登录成功</h3>
+      <p>你可以返回登录页，系统会自动完成登录。</p>
+      <script>setTimeout(function(){ window.close(); }, 1200)</script>
+      </body></html>
+    `);
+  } catch (err) {
+    db.prepare('UPDATE sso_challenges SET status = ? WHERE id = ?').run('expired', state);
+    return res.status(500).send('Google SSO callback failed');
+  }
 });
 
 app.get('/api/auth/sso/challenge/:id', (req, res) => {

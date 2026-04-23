@@ -6,10 +6,12 @@ interface LoginProps {
   onLogin: (user: any) => void;
 }
 
-type SsoProvider = 'wechat' | 'feishu';
+type SsoProvider = 'google' | 'wechat' | 'feishu';
 type SsoStatus = 'idle' | 'pending' | 'approved' | 'expired' | 'completed';
+type ProviderConfig = { id: SsoProvider; name: string; enabled: boolean };
 
 const PROVIDER_LABEL: Record<SsoProvider, string> = {
+  google: 'Google',
   wechat: '微信',
   feishu: '飞书'
 };
@@ -22,6 +24,11 @@ export function Login({ onLogin }: LoginProps) {
   const [confirmPassword, setConfirmPassword] = useState('');
 
   const [ssoProvider, setSsoProvider] = useState<SsoProvider>('wechat');
+  const [providerConfigs, setProviderConfigs] = useState<ProviderConfig[]>([
+    { id: 'google', name: 'Google', enabled: false },
+    { id: 'wechat', name: '微信', enabled: true },
+    { id: 'feishu', name: '飞书', enabled: true }
+  ]);
   const [challengeId, setChallengeId] = useState('');
   const [expiresAt, setExpiresAt] = useState('');
   const [scanUser, setScanUser] = useState('');
@@ -47,6 +54,19 @@ export function Login({ onLogin }: LoginProps) {
     return () => clearInterval(timer);
   }, [loginMode, challengeId, ssoStatus]);
 
+  useEffect(() => {
+    if (isRegistering) return;
+    apiFetch('/api/auth/sso/providers')
+      .then((data) => {
+        if (Array.isArray(data?.providers)) {
+          setProviderConfigs(data.providers);
+          const firstEnabled = data.providers.find((p: ProviderConfig) => p.enabled);
+          if (firstEnabled) setSsoProvider(firstEnabled.id);
+        }
+      })
+      .catch(() => {});
+  }, [isRegistering]);
+
   const resetFeedback = () => {
     setError('');
     setSuccess('');
@@ -67,7 +87,8 @@ export function Login({ onLogin }: LoginProps) {
       if (password !== confirmPassword) return setError('两次输入的密码不一致');
       if (!/^[a-zA-Z0-9_]+$/.test(username)) return setError('用户名只能包含字母、数字和下划线');
       if (username.length < 3 || username.length > 20) return setError('用户名长度必须在3到20个字符之间');
-      if (password.length < 6) return setError('密码长度至少为6个字符');
+      const strong = password.length >= 10 && /[A-Z]/.test(password) && /[a-z]/.test(password) && /\d/.test(password) && /[^A-Za-z0-9]/.test(password);
+      if (!strong) return setError('密码强度不足：至少10位，且包含大小写字母、数字和特殊字符');
     }
 
     setIsLoading(true);
@@ -90,15 +111,22 @@ export function Login({ onLogin }: LoginProps) {
     resetFeedback();
     setIsLoading(true);
     try {
-      const data = await apiFetch('/api/auth/sso/challenge', {
-        method: 'POST',
-        body: JSON.stringify({ provider })
-      });
+      const data = provider === 'google'
+        ? await apiFetch('/api/auth/sso/google/start', { method: 'POST' })
+        : await apiFetch('/api/auth/sso/challenge', {
+            method: 'POST',
+            body: JSON.stringify({ provider })
+          });
       setSsoProvider(provider);
       setChallengeId(data.challengeId);
       setExpiresAt(data.expiresAt);
       setSsoStatus('pending');
-      setSuccess(`已生成 ${PROVIDER_LABEL[provider]} 扫码授权二维码，请在 2 分钟内完成扫码。`);
+      if (provider === 'google' && data.authUrl) {
+        window.open(data.authUrl, '_blank', 'noopener,noreferrer,width=520,height=680');
+        setSuccess('已打开 Google 授权窗口，请完成授权后返回本页，系统将自动检测登录状态。');
+      } else {
+        setSuccess(`已生成 ${PROVIDER_LABEL[provider]} 扫码授权二维码，请在 2 分钟内完成扫码。`);
+      }
     } catch (err: any) {
       setError(err.message || '获取二维码失败');
     } finally {
@@ -165,7 +193,7 @@ export function Login({ onLogin }: LoginProps) {
           {!isRegistering && (
             <div className="grid grid-cols-2 bg-slate-100 p-1 rounded-xl mb-5">
               <button type="button" onClick={() => { setLoginMode('password'); resetSso(); }} className={`py-2 text-sm rounded-lg transition ${loginMode === 'password' ? 'bg-white shadow text-indigo-700' : 'text-slate-500'}`}>密码登录</button>
-              <button type="button" onClick={() => setLoginMode('sso')} className={`py-2 text-sm rounded-lg transition ${loginMode === 'sso' ? 'bg-white shadow text-indigo-700' : 'text-slate-500'}`}>微信/飞书扫码</button>
+              <button type="button" onClick={() => setLoginMode('sso')} className={`py-2 text-sm rounded-lg transition ${loginMode === 'sso' ? 'bg-white shadow text-indigo-700' : 'text-slate-500'}`}>Google/微信/飞书登录</button>
             </div>
           )}
 
@@ -222,14 +250,15 @@ export function Login({ onLogin }: LoginProps) {
           ) : (
             <div className="space-y-4">
               <div className="grid grid-cols-2 gap-2">
-                {(Object.keys(PROVIDER_LABEL) as SsoProvider[]).map((provider) => (
+                {providerConfigs.map((provider) => (
                   <button
-                    key={provider}
+                    key={provider.id}
                     type="button"
-                    onClick={() => createChallenge(provider)}
-                    className={`py-2 rounded-lg border text-sm ${ssoProvider === provider ? 'border-indigo-500 bg-indigo-50 text-indigo-700' : 'border-slate-200 text-slate-600'}`}
+                    onClick={() => createChallenge(provider.id)}
+                    disabled={!provider.enabled}
+                    className={`py-2 rounded-lg border text-sm ${ssoProvider === provider.id ? 'border-indigo-500 bg-indigo-50 text-indigo-700' : 'border-slate-200 text-slate-600'} disabled:opacity-40 disabled:cursor-not-allowed`}
                   >
-                    {PROVIDER_LABEL[provider]}授权
+                    {PROVIDER_LABEL[provider.id]}授权
                   </button>
                 ))}
               </div>
