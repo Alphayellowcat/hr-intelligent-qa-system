@@ -26,6 +26,39 @@ interface ChatProps {
   onStartNewChat: () => void;
 }
 
+interface PlanItem {
+  id: string;
+  question: string;
+  objective: string;
+}
+
+interface ExecutionPlan {
+  complexity: 'simple' | 'moderate' | 'complex';
+  reasoning: string;
+  subQuestions: PlanItem[];
+  missingInfo: string[];
+}
+
+interface EvidenceItem {
+  source: string;
+  snippet: string;
+  method: 'read_file' | 'search_files' | 'semantic_search';
+}
+
+interface ReferenceScore {
+  source: string;
+  score: number;
+}
+
+interface AgentMemorySuggestion {
+  id: string;
+  score: number;
+  successCount: number;
+  signature: string;
+  retrievalSummary?: string;
+  plan?: any;
+}
+
 const STARTER_PROMPTS: Record<string, string[]> = {
   qa: ['我这个月的加班费怎么算？', '请帮我梳理请年假的流程和审批节点', '试用期内社保从什么时候开始缴纳？'],
   onboarding: ['新员工第一周我需要完成哪些事项？', '医院考勤打卡与迟到规则是怎样的？', '入职后常见系统账号开通流程是什么？'],
@@ -43,6 +76,69 @@ export function Chat({ mode, modeId, systemPrompt, welcomeMessage, knowledgeBase
   const [expandedAgentLogs, setExpandedAgentLogs] = useState<Record<string, boolean>>({});
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  const parseJsonSafely = <T,>(value: string, fallback: T): T => {
+    try {
+      return JSON.parse(value) as T;
+    } catch {
+      return fallback;
+    }
+  };
+
+  const parseToolArguments = (value: string): Record<string, any> => {
+    try {
+      const parsed = JSON.parse(value);
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  };
+
+  const compressReferences = (
+    sources: Set<string>,
+    evidenceItems: EvidenceItem[],
+    maxItems = 8
+  ): string[] => {
+    const sourceScoreMap = new Map<string, number>();
+    for (const item of evidenceItems) {
+      if (!item.source) continue;
+      sourceScoreMap.set(item.source, (sourceScoreMap.get(item.source) || 0) + 1);
+    }
+    for (const src of sources) {
+      if (!sourceScoreMap.has(src)) sourceScoreMap.set(src, 1);
+    }
+
+    const scored: ReferenceScore[] = Array.from(sourceScoreMap.entries())
+      .map(([source, score]) => ({ source, score }))
+      .sort((a, b) => b.score - a.score);
+
+    const asLabel = (path: string) => {
+      const clean = path.replace(/^\//, '');
+      const segs = clean.split('/');
+      if (segs.length <= 1) return clean;
+      return `${segs[0]}/${segs[segs.length - 1]}`;
+    };
+
+    if (scored.length <= maxItems) {
+      return scored.map((item) => asLabel(item.source));
+    }
+
+    const head = scored.slice(0, Math.max(4, maxItems - 2)).map((item) => asLabel(item.source));
+    const tail = scored.slice(Math.max(4, maxItems - 2));
+    const grouped = new Map<string, number>();
+    for (const item of tail) {
+      const clean = item.source.replace(/^\//, '');
+      const folder = clean.includes('/') ? clean.split('/')[0] : '其他';
+      grouped.set(folder, (grouped.get(folder) || 0) + 1);
+    }
+    const tailSummary = Array.from(grouped.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 2)
+      .map(([folder, count]) => `${folder}(${count})`)
+      .join('、');
+
+    return [...head, `其余 ${tail.length} 个来源已压缩：${tailSummary || '其他'}`];
+  };
 
   // Reset chat when mode or thread changes
   useEffect(() => {
@@ -184,10 +280,96 @@ export function Chat({ mode, modeId, systemPrompt, welcomeMessage, knowledgeBase
         }
       }];
 
+      const planningPrompt = `你是一个问题分解规划器。请先判断用户问题复杂度，并拆分为可检索的子问题。
+必须返回 JSON（不要 markdown，不要解释）：
+{
+  "complexity": "simple|moderate|complex",
+  "reasoning": "一句话说明为什么这么拆分",
+  "subQuestions": [{"id":"Q1","question":"...","objective":"..."}],
+  "missingInfo": ["若问题存在必要前提缺失，列出来"]
+}
+要求：
+1) simple 最多 1-2 个子问题，complex 可 3-5 个子问题；
+2) 子问题要覆盖：定义/范围、条件限制、例外条款、流程时序（若适用）；
+3) 如果用户问题本身已很具体，也要保证至少 1 个子问题。
+
+用户问题：${userMessage.content}`;
+
+      let memoryHints: AgentMemorySuggestion[] = [];
+      try {
+        const memoryResp = await apiFetch('/api/agent-memory/suggest', {
+          method: 'POST',
+          body: JSON.stringify({ question: userMessage.content })
+        });
+        memoryHints = Array.isArray(memoryResp?.items) ? memoryResp.items.slice(0, 3) : [];
+      } catch (e) {
+        console.warn('Agent memory suggest failed:', e);
+      }
+      if (memoryHints.length > 0) {
+        setAgentStatus('正在加载历史稳定策略...');
+      }
+
+      const planningPromptWithMemory = `${planningPrompt}
+
+历史稳定策略（可参考，不可照抄）：
+${memoryHints.length > 0 ? JSON.stringify(memoryHints.map((m) => ({
+  successCount: m.successCount,
+  signature: m.signature,
+  retrievalSummary: m.retrievalSummary,
+  plan: m.plan
+})), null, 2) : '无'}`;
+
+      setAgentStatus('正在规划检索路径...');
+      const planningResponse = await client.chat.completions.create({
+        model: 'dummy',
+        messages: [{ role: 'user', content: planningPromptWithMemory }],
+        temperature: 0.1,
+        enable_thinking: false,
+        tool_choice: 'none',
+      } as any);
+
+      const rawPlan = planningResponse?.choices?.[0]?.message?.content || '';
+      let parsedPlan = parseJsonSafely<ExecutionPlan>(rawPlan, {
+        complexity: 'moderate',
+        reasoning: '默认使用单步检索后综合回答。',
+        subQuestions: [{ id: 'Q1', question: userMessage.content, objective: '直接回答用户问题' }],
+        missingInfo: []
+      });
+      if (!Array.isArray(parsedPlan.subQuestions) || parsedPlan.subQuestions.length === 0) {
+        const repairResponse = await client.chat.completions.create({
+          model: 'dummy',
+          messages: [{
+            role: 'user',
+            content: `将下列文本转换为严格 JSON，字段必须是 complexity/reasoning/subQuestions/missingInfo，且 subQuestions 至少 1 条：\n${rawPlan}`
+          }],
+          temperature: 0,
+          enable_thinking: false,
+          tool_choice: 'none',
+        } as any);
+        const repairedContent = repairResponse?.choices?.[0]?.message?.content || '';
+        parsedPlan = parseJsonSafely<ExecutionPlan>(repairedContent, parsedPlan);
+      }
+      const normalizedPlan: ExecutionPlan = {
+        complexity: parsedPlan.complexity || 'moderate',
+        reasoning: parsedPlan.reasoning || '默认规划',
+        subQuestions: Array.isArray(parsedPlan.subQuestions) && parsedPlan.subQuestions.length > 0
+          ? parsedPlan.subQuestions.slice(0, 5)
+          : [{ id: 'Q1', question: userMessage.content, objective: '直接回答用户问题' }],
+        missingInfo: Array.isArray(parsedPlan.missingInfo) ? parsedPlan.missingInfo.slice(0, 5) : []
+      };
+
       const agentInstruction = `${systemPrompt}
 
 You have access to the company's knowledge base file system. You MUST use the provided tools (list_directory, read_file, search_files, semantic_search) to navigate the directories, find relevant files, and read their contents to answer the user's question.
 Think step-by-step like an agent. Combine exact search (search_files) and semantic search (semantic_search) to find the best information. Do not guess information.
+
+Execution plan (must follow):
+${JSON.stringify(normalizedPlan, null, 2)}
+
+Boundary requirements (critical):
+- Distinguish clearly between "known with evidence" and "unknown / insufficient evidence".
+- Every key conclusion must have at least one evidence reference from tools.
+- If evidence is insufficient, explicitly say what is unknown and what extra info/doc is needed.
 
 CRITICAL - Final Answer Requirement:
 - When calling tools, do NOT output content like "让我搜索" or "正在分析" - keep content empty or minimal.
@@ -221,9 +403,35 @@ CRITICAL - Final Answer Requirement:
       }
 
       let referencedTitles = new Set<string>();
+      const referencedSources = new Set<string>();
       let agentLogs: string[] = [];
+      const evidenceBoardMap = new Map<string, EvidenceItem>();
+      const pushEvidence = (evidence: EvidenceItem) => {
+        const trimmedSnippet = evidence.snippet.replace(/\s+/g, ' ').trim().slice(0, 280);
+        if (!trimmedSnippet) return;
+        const key = `${evidence.method}|${evidence.source}|${trimmedSnippet}`;
+        if (!evidenceBoardMap.has(key)) {
+          evidenceBoardMap.set(key, { ...evidence, snippet: trimmedSnippet });
+        }
+      };
+      const pushReferenceFromPath = (filePath: string) => {
+        referencedSources.add(filePath);
+        const title = filePath.split('/').filter(Boolean).pop();
+        if (title) referencedTitles.add(title);
+      };
+      agentLogs.push(`规划复杂度: ${normalizedPlan.complexity}`);
+      agentLogs.push(`规划说明: ${normalizedPlan.reasoning}`);
+      if (memoryHints.length > 0) {
+        agentLogs.push(`命中历史稳定策略: ${memoryHints.map((m) => `${m.signature}(x${m.successCount})`).join(' | ')}`);
+      }
+      normalizedPlan.subQuestions.forEach((q) => {
+        agentLogs.push(`子问题 ${q.id}: ${q.question}`);
+      });
+      normalizedPlan.missingInfo.forEach((item) => {
+        agentLogs.push(`待补充信息: ${item}`);
+      });
       let loopCount = 0;
-      const MAX_LOOPS = 8;
+      const MAX_LOOPS = Math.min(12, Math.max(6, normalizedPlan.subQuestions.length * 3));
 
       while (response.choices[0].message.tool_calls && response.choices[0].message.tool_calls.length > 0 && loopCount < MAX_LOOPS) {
         loopCount++;
@@ -233,7 +441,7 @@ CRITICAL - Final Answer Requirement:
         
         for (const call of message.tool_calls as any[]) {
           let result: any = {};
-          const args = JSON.parse(call.function.arguments);
+          const args = parseToolArguments(call.function.arguments);
           
           if (call.function.name === 'list_directory') {
             const path = args.path || '/';
@@ -262,7 +470,13 @@ CRITICAL - Final Answer Requirement:
               for (const file of folder.files) {
                 if (file.key === cleanPath || `${folder.folder}/${file.name}` === cleanPath) {
                   result = { content: file.content };
+                  pushReferenceFromPath(`/${folder.folder}/${file.name}`);
                   referencedTitles.add(file.name);
+                  pushEvidence({
+                    source: `/${folder.folder}/${file.name}`,
+                    snippet: file.content.substring(0, 400),
+                    method: 'read_file'
+                  });
                   found = true;
                   break;
                 }
@@ -297,6 +511,12 @@ CRITICAL - Final Answer Requirement:
                       filePath: `/${folder.folder}/${file.name}`,
                       snippet
                     });
+                    pushEvidence({
+                      source: `/${folder.folder}/${file.name}`,
+                      snippet,
+                      method: 'search_files'
+                    });
+                    pushReferenceFromPath(`/${folder.folder}/${file.name}`);
                   }
                 }
               }
@@ -328,6 +548,14 @@ CRITICAL - Final Answer Requirement:
                       similarityScore: m.similarityScore
                     }))
                   };
+                  for (const m of searchResp.matches.slice(0, 3)) {
+                    pushEvidence({
+                      source: m.filePath,
+                      snippet: m.snippet,
+                      method: 'semantic_search'
+                    });
+                    pushReferenceFromPath(m.filePath);
+                  }
                 } else {
                   result = searchResp.error ? { error: searchResp.error } : { message: "No matches found." };
                 }
@@ -336,6 +564,9 @@ CRITICAL - Final Answer Requirement:
                 result = { error: String(err) };
               }
             }
+          } else {
+            result = { error: `Unsupported tool: ${call.function.name}` };
+            agentLogs.push(`未知工具调用: ${call.function.name}`);
           }
           
           openAiMessages.push({
@@ -388,15 +619,71 @@ CRITICAL - Final Answer Requirement:
         }
       }
 
+      setAgentStatus('正在执行边界校验...');
+      const evidenceBoard = Array.from(evidenceBoardMap.values());
+      const evidenceDigest = evidenceBoard.slice(0, 18).map((e, idx) =>
+        `${idx + 1}. [${e.method}] ${e.source}: ${e.snippet.replace(/\s+/g, ' ').slice(0, 180)}`
+      ).join('\n');
+      const boundaryPrompt = `请对下面答案做“已知/未知边界校验”，输出最终 markdown 答案。
+
+用户原问题：
+${userMessage.content}
+
+执行规划：
+${JSON.stringify(normalizedPlan, null, 2)}
+
+可用证据摘录：
+${evidenceDigest || '（无）'}
+
+草稿答案：
+${finalContent || '（无）'}
+
+输出要求（必须满足）：
+1) 先给“结论摘要”；
+2) 再给“已确认信息（有依据）”；
+3) 再给“尚不确定/缺失信息”；
+4) 若证据不足，明确给出“建议补充材料或人工确认项”；
+5) 不要编造未提供的政策条款。`;
+      const boundaryResponse = await client.chat.completions.create({
+        model: 'dummy',
+        messages: [{ role: 'user', content: boundaryPrompt }],
+        temperature: 0.1,
+        enable_thinking: false,
+        tool_choice: 'none',
+      } as any);
+      const boundaryContent = boundaryResponse?.choices?.[0]?.message?.content?.trim();
+      if (boundaryContent) {
+        finalContent = boundaryContent;
+      }
+
       if (finalContent) {
+        const evidenceBoard = Array.from(evidenceBoardMap.values());
+        const compressedReferences = compressReferences(referencedSources, evidenceBoard);
+        if (compressedReferences.some((item) => item.includes('已压缩'))) {
+          agentLogs.push(`参考来源已压缩: ${compressedReferences[compressedReferences.length - 1]}`);
+        }
         const assistantMessage: Message = {
           id: (Date.now() + 1).toString(),
           role: 'assistant',
           content: finalContent,
-          references: Array.from(referencedTitles),
+          references: compressedReferences.length > 0 ? compressedReferences : Array.from(referencedTitles),
           agentLogs: agentLogs.length > 0 ? agentLogs : undefined
         };
         setMessages((prev) => [...prev, assistantMessage]);
+
+        try {
+          await apiFetch('/api/agent-memory/record', {
+            method: 'POST',
+            body: JSON.stringify({
+              question: userMessage.content,
+              plan: normalizedPlan,
+              retrievalSummary: `loops=${loopCount}; refs=${compressedReferences.length}; evidence=${evidenceBoard.length}`,
+              success: true
+            })
+          });
+        } catch (e) {
+          console.warn('Agent memory record failed:', e);
+        }
 
         if (currentThreadId) {
           await apiFetch(`/api/chat/threads/${currentThreadId}/messages`, {

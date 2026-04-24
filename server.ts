@@ -106,6 +106,32 @@ function verifyPassword(password: string, stored: string): Promise<boolean> {
   });
 }
 
+function tokenizeQuestion(text: string): string[] {
+  return (text || '')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length >= 2)
+    .slice(0, 20);
+}
+
+function makeQuestionSignature(text: string): string {
+  return (text || '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 160);
+}
+
+function parseJsonSafe<T>(raw: string | null | undefined, fallback: T): T {
+  if (!raw) return fallback;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
+
 // --- Database Setup ---
 const db = new Database('app.db');
 db.pragma('journal_mode = WAL');
@@ -178,6 +204,19 @@ db.exec(`
     user_id INTEGER,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(provider, provider_user_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS agent_memories (
+    id TEXT PRIMARY KEY,
+    owner_user_id INTEGER,
+    question_signature TEXT,
+    keywords TEXT,
+    plan_json TEXT,
+    retrieval_summary TEXT,
+    success_count INTEGER DEFAULT 0,
+    last_used_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 `);
 
@@ -757,6 +796,95 @@ app.post('/api/openai/v1/embeddings', authMiddleware, async (req: any, res) => {
     );
     if (!response.ok) return res.status(response.status).send(await response.text());
     res.json(await response.json());
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Agent memory for self-learning retrieval patterns
+app.post('/api/agent-memory/suggest', authMiddleware, (req: any, res) => {
+  try {
+    const { question } = req.body || {};
+    if (!question || typeof question !== 'string') return res.status(400).json({ error: 'Missing question' });
+    const tokens = tokenizeQuestion(question);
+    if (tokens.length === 0) return res.json({ items: [] });
+
+    const rows = db.prepare(
+      `SELECT * FROM agent_memories
+       WHERE owner_user_id = ?
+       ORDER BY success_count DESC, updated_at DESC
+       LIMIT 40`
+    ).all(req.user.id) as any[];
+
+    const scored = rows
+      .map((row) => {
+        const memoryTokens: string[] = parseJsonSafe<string[]>(row.keywords, []);
+        const overlap = tokens.filter((t) => memoryTokens.includes(t)).length;
+        return {
+          id: row.id,
+          score: overlap + Math.min(Number(row.success_count || 0), 5) * 0.2,
+          overlap,
+          successCount: row.success_count || 0,
+          signature: row.question_signature,
+          retrievalSummary: row.retrieval_summary,
+          plan: parseJsonSafe<any>(row.plan_json, null)
+        };
+      })
+      .filter((item) => item.overlap > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 3);
+
+    res.json({ items: scored });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/agent-memory/record', authMiddleware, (req: any, res) => {
+  try {
+    const { question, plan, retrievalSummary, success } = req.body || {};
+    if (!question || typeof question !== 'string') return res.status(400).json({ error: 'Missing question' });
+    if (!success) return res.json({ success: true, skipped: true });
+
+    const signature = makeQuestionSignature(question);
+    const keywords = tokenizeQuestion(question);
+    if (keywords.length === 0) return res.json({ success: true, skipped: true });
+
+    const existing = db.prepare(
+      'SELECT id FROM agent_memories WHERE owner_user_id = ? AND question_signature = ?'
+    ).get(req.user.id, signature) as any;
+
+    if (existing?.id) {
+      db.prepare(
+        `UPDATE agent_memories
+         SET keywords = ?, plan_json = ?, retrieval_summary = ?,
+             success_count = success_count + 1,
+             last_used_at = CURRENT_TIMESTAMP,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?`
+      ).run(
+        JSON.stringify(keywords),
+        plan ? JSON.stringify(plan) : null,
+        retrievalSummary || null,
+        existing.id
+      );
+      return res.json({ success: true, id: existing.id, updated: true });
+    }
+
+    const id = crypto.randomUUID();
+    db.prepare(
+      `INSERT INTO agent_memories
+       (id, owner_user_id, question_signature, keywords, plan_json, retrieval_summary, success_count)
+       VALUES (?, ?, ?, ?, ?, ?, 1)`
+    ).run(
+      id,
+      req.user.id,
+      signature,
+      JSON.stringify(keywords),
+      plan ? JSON.stringify(plan) : null,
+      retrievalSummary || null
+    );
+    res.json({ success: true, id, created: true });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
