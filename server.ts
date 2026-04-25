@@ -13,6 +13,8 @@ const app = express();
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const SESSION_TTL_MS = parseInt(process.env.SESSION_TTL_MS || `${7 * 24 * 60 * 60 * 1000}`, 10);
 const SSO_CHALLENGE_TTL_MS = 2 * 60 * 1000;
+const SSO_MOCK_ENABLED = process.env.SSO_MOCK_ENABLED === 'true';
+const SSO_MOCK_KEY = process.env.SSO_MOCK_KEY || '';
 const LOG_API_REQUESTS = process.env.LOG_API_REQUESTS !== 'false';
 
 app.disable('x-powered-by');
@@ -475,6 +477,7 @@ app.get('/api/auth/me', authMiddleware, (req: any, res) => {
 app.get('/api/auth/sso/providers', (req, res) => {
   const googleEnabled = !!process.env.GOOGLE_CLIENT_ID && !!process.env.GOOGLE_CLIENT_SECRET;
   res.json({
+    mockEnabled: SSO_MOCK_ENABLED,
     providers: [
       { id: 'google', name: 'Google', enabled: googleEnabled },
       { id: 'wechat', name: '微信', enabled: true },
@@ -649,6 +652,16 @@ app.get('/api/auth/sso/challenge/:id', (req, res) => {
 
 // Demo 模拟扫码回调（生产环境请替换为微信/飞书官方回调）
 app.post('/api/auth/sso/mock/complete', (req, res) => {
+  if (!SSO_MOCK_ENABLED) {
+    return res.status(403).json({ error: 'Mock SSO 已禁用' });
+  }
+  if (SSO_MOCK_KEY) {
+    const key = String(req.headers['x-mock-sso-key'] || '');
+    if (key !== SSO_MOCK_KEY) {
+      return res.status(403).json({ error: 'Mock SSO 鉴权失败' });
+    }
+  }
+
   const { challengeId, username } = req.body || {};
   if (!challengeId || !username) return res.status(400).json({ error: '参数不完整' });
   const challenge = db.prepare('SELECT * FROM sso_challenges WHERE id = ?').get(challengeId) as any;
@@ -727,6 +740,8 @@ app.get('/api/admin/users', authMiddleware, requireAdmin, (req, res) => {
 app.post('/api/admin/users', authMiddleware, requireAdmin, async (req, res) => {
   const { username, password, role, displayName } = req.body || {};
   if (!username || !password) return res.status(400).json({ error: '用户名和密码不能为空' });
+  if (!/^[a-zA-Z0-9_]+$/.test(username)) return res.status(400).json({ error: '用户名只能包含字母、数字和下划线' });
+  if (username.length < 3 || username.length > 20) return res.status(400).json({ error: '用户名长度必须在3到20个字符之间' });
   if (!['admin', 'employee'].includes(role)) return res.status(400).json({ error: '角色不合法' });
   if (!isStrongPassword(password)) return res.status(400).json({ error: '初始密码强度不足' });
   const exists = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
@@ -747,9 +762,17 @@ app.patch('/api/admin/users/:id', authMiddleware, requireAdmin, async (req: any,
   if (role && !['admin', 'employee'].includes(role)) return res.status(400).json({ error: '角色不合法' });
   if (status && !['active', 'disabled'].includes(status)) return res.status(400).json({ error: '状态不合法' });
 
+  const nextRole = role || user.role;
+  const nextStatus = status || user.status;
+  const adminCountRow = db.prepare("SELECT COUNT(*) as cnt FROM users WHERE role = 'admin' AND status = 'active'").get() as { cnt: number };
+  const isLastActiveAdmin = user.role === 'admin' && user.status === 'active' && Number(adminCountRow?.cnt || 0) <= 1;
+  if (isLastActiveAdmin && (nextRole !== 'admin' || nextStatus !== 'active')) {
+    return res.status(400).json({ error: '系统至少需要保留一个启用状态的管理员账号' });
+  }
+
   if (role) db.prepare('UPDATE users SET role = ? WHERE id = ?').run(role, id);
   if (status) db.prepare('UPDATE users SET status = ? WHERE id = ?').run(status, id);
-  if (displayName) db.prepare('UPDATE users SET display_name = ? WHERE id = ?').run(displayName, id);
+  if (typeof displayName === 'string') db.prepare('UPDATE users SET display_name = ? WHERE id = ?').run(displayName.trim() || user.username, id);
   if (resetPassword) {
     if (!isStrongPassword(resetPassword)) {
       return res.status(400).json({ error: '重置密码强度不足' });

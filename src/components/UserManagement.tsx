@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { apiFetch } from '../api';
-import { Loader2, Users, UserPlus, RefreshCcw, Search, KeyRound } from 'lucide-react';
+import { Loader2, Users, UserPlus, RefreshCcw, Search, KeyRound, Eye, EyeOff } from 'lucide-react';
 
 interface UserRow {
   id: number;
@@ -19,6 +19,16 @@ export function UserManagement() {
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [query, setQuery] = useState('');
   const [form, setForm] = useState({ username: '', password: '', role: 'employee', displayName: '' });
+  const [resetPwdDraft, setResetPwdDraft] = useState<Record<number, string>>({});
+  const [showResetPwd, setShowResetPwd] = useState<Record<number, boolean>>({});
+
+  const generateStrongPassword = () => {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*_+-=';
+    const pick = () => chars[Math.floor(Math.random() * chars.length)];
+    let pwd = 'Aa1!';
+    while (pwd.length < 14) pwd += pick();
+    return pwd;
+  };
 
   const loadUsers = async () => {
     setLoading(true);
@@ -78,6 +88,14 @@ export function UserManagement() {
     }
   };
 
+  const applyGeneratedCreatePassword = () => {
+    setForm((f) => ({ ...f, password: generateStrongPassword() }));
+  };
+
+  const applyGeneratedResetPassword = (id: number) => {
+    setResetPwdDraft((prev) => ({ ...prev, [id]: generateStrongPassword() }));
+  };
+
   return (
     <div className="h-full bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden flex flex-col">
       <div className="p-4 border-b border-slate-200 bg-slate-50 flex flex-wrap items-center justify-between gap-3">
@@ -97,10 +115,13 @@ export function UserManagement() {
           </div>
         )}
 
-        <div className="grid grid-cols-1 md:grid-cols-5 gap-2">
+        <div className="grid grid-cols-1 md:grid-cols-6 gap-2">
           <input className="border rounded-lg px-3 py-2 text-sm" placeholder="用户名" value={form.username} onChange={(e) => setForm((f) => ({ ...f, username: e.target.value }))} />
           <input className="border rounded-lg px-3 py-2 text-sm" placeholder="显示名" value={form.displayName} onChange={(e) => setForm((f) => ({ ...f, displayName: e.target.value }))} />
           <input className="border rounded-lg px-3 py-2 text-sm" type="password" placeholder="初始密码" value={form.password} onChange={(e) => setForm((f) => ({ ...f, password: e.target.value }))} />
+          <button type="button" onClick={applyGeneratedCreatePassword} className="border rounded-lg px-3 py-2 text-xs text-slate-600 hover:bg-slate-50">
+            生成强密码
+          </button>
           <select className="border rounded-lg px-3 py-2 text-sm" value={form.role} onChange={(e) => setForm((f) => ({ ...f, role: e.target.value }))}>
             <option value="employee">员工</option>
             <option value="admin">管理员</option>
@@ -148,18 +169,45 @@ export function UserManagement() {
                       <option value="active">启用</option>
                       <option value="disabled">停用</option>
                     </select>
+                    {u.must_change_password ? <div className="text-[11px] text-amber-600 mt-1">下次登录需改密</div> : null}
                   </td>
                   <td className="text-slate-500">{u.last_login_at ? new Date(u.last_login_at).toLocaleString() : '-'}</td>
                   <td className="text-right">
-                    <button
-                      className="text-xs px-2 py-1 rounded border border-slate-300 hover:bg-slate-50 inline-flex items-center gap-1"
-                      onClick={() => {
-                        if (!window.confirm(`确认重置 ${u.username} 的密码为 ChangeMe123! ?`)) return;
-                        updateUser(u.id, { resetPassword: 'ChangeMe123!' });
-                      }}
-                    >
-                      <KeyRound className="w-3.5 h-3.5" />重置密码
-                    </button>
+                    <div className="inline-flex items-center gap-1.5">
+                      <input
+                        className="w-40 border rounded px-2 py-1 text-xs"
+                        type={showResetPwd[u.id] ? 'text' : 'password'}
+                        placeholder="输入重置密码"
+                        value={resetPwdDraft[u.id] || ''}
+                        onChange={(e) => setResetPwdDraft((prev) => ({ ...prev, [u.id]: e.target.value }))}
+                      />
+                      <button
+                        className="text-xs px-2 py-1 rounded border border-slate-300 hover:bg-slate-50"
+                        type="button"
+                        onClick={() => setShowResetPwd((prev) => ({ ...prev, [u.id]: !prev[u.id] }))}
+                        title={showResetPwd[u.id] ? '隐藏密码' : '显示密码'}
+                      >
+                        {showResetPwd[u.id] ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                      </button>
+                      <button className="text-xs px-2 py-1 rounded border border-slate-300 hover:bg-slate-50" type="button" onClick={() => applyGeneratedResetPassword(u.id)}>
+                        生成
+                      </button>
+                      <button
+                        className="text-xs px-2 py-1 rounded border border-slate-300 hover:bg-slate-50 inline-flex items-center gap-1"
+                        onClick={() => {
+                          const password = (resetPwdDraft[u.id] || '').trim();
+                          if (!password) {
+                            setMessage({ type: 'error', text: `请先为 ${u.username} 输入重置密码` });
+                            return;
+                          }
+                          if (!window.confirm(`确认重置 ${u.username} 的密码？`)) return;
+                          updateUser(u.id, { resetPassword: password });
+                          setResetPwdDraft((prev) => ({ ...prev, [u.id]: '' }));
+                        }}
+                      >
+                        <KeyRound className="w-3.5 h-3.5" />重置
+                      </button>
+                    </div>
                   </td>
                 </tr>
               ))}
