@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { apiFetch } from '../api';
-import { Loader2, Users, UserPlus, RefreshCcw, Search, KeyRound } from 'lucide-react';
+import { Loader2, Users, UserPlus, RefreshCcw, Search, KeyRound, Eye, EyeOff } from 'lucide-react';
 
 interface UserRow {
   id: number;
@@ -20,6 +20,7 @@ export function UserManagement() {
   const [query, setQuery] = useState('');
   const [form, setForm] = useState({ username: '', password: '', role: 'employee', displayName: '' });
   const [resetPwdDraft, setResetPwdDraft] = useState<Record<number, string>>({});
+  const [showResetPwd, setShowResetPwd] = useState<Record<number, boolean>>({});
 
   const generateStrongPassword = () => {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*_+-=';
@@ -175,11 +176,19 @@ export function UserManagement() {
                     <div className="inline-flex items-center gap-1.5">
                       <input
                         className="w-40 border rounded px-2 py-1 text-xs"
-                        type="text"
+                        type={showResetPwd[u.id] ? 'text' : 'password'}
                         placeholder="输入重置密码"
                         value={resetPwdDraft[u.id] || ''}
                         onChange={(e) => setResetPwdDraft((prev) => ({ ...prev, [u.id]: e.target.value }))}
                       />
+                      <button
+                        className="text-xs px-2 py-1 rounded border border-slate-300 hover:bg-slate-50"
+                        type="button"
+                        onClick={() => setShowResetPwd((prev) => ({ ...prev, [u.id]: !prev[u.id] }))}
+                        title={showResetPwd[u.id] ? '隐藏密码' : '显示密码'}
+                      >
+                        {showResetPwd[u.id] ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                      </button>
                       <button className="text-xs px-2 py-1 rounded border border-slate-300 hover:bg-slate-50" type="button" onClick={() => applyGeneratedResetPassword(u.id)}>
                         生成
                       </button>

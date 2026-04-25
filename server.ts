@@ -13,6 +13,8 @@ const app = express();
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const SESSION_TTL_MS = parseInt(process.env.SESSION_TTL_MS || `${7 * 24 * 60 * 60 * 1000}`, 10);
 const SSO_CHALLENGE_TTL_MS = 2 * 60 * 1000;
+const SSO_MOCK_ENABLED = process.env.SSO_MOCK_ENABLED === 'true';
+const SSO_MOCK_KEY = process.env.SSO_MOCK_KEY || '';
 const LOG_API_REQUESTS = process.env.LOG_API_REQUESTS !== 'false';
 
 app.disable('x-powered-by');
@@ -475,6 +477,7 @@ app.get('/api/auth/me', authMiddleware, (req: any, res) => {
 app.get('/api/auth/sso/providers', (req, res) => {
   const googleEnabled = !!process.env.GOOGLE_CLIENT_ID && !!process.env.GOOGLE_CLIENT_SECRET;
   res.json({
+    mockEnabled: SSO_MOCK_ENABLED,
     providers: [
       { id: 'google', name: 'Google', enabled: googleEnabled },
       { id: 'wechat', name: '微信', enabled: true },
@@ -649,6 +652,16 @@ app.get('/api/auth/sso/challenge/:id', (req, res) => {
 
 // Demo 模拟扫码回调（生产环境请替换为微信/飞书官方回调）
 app.post('/api/auth/sso/mock/complete', (req, res) => {
+  if (!SSO_MOCK_ENABLED) {
+    return res.status(403).json({ error: 'Mock SSO 已禁用' });
+  }
+  if (SSO_MOCK_KEY) {
+    const key = String(req.headers['x-mock-sso-key'] || '');
+    if (key !== SSO_MOCK_KEY) {
+      return res.status(403).json({ error: 'Mock SSO 鉴权失败' });
+    }
+  }
+
   const { challengeId, username } = req.body || {};
   if (!challengeId || !username) return res.status(400).json({ error: '参数不完整' });
   const challenge = db.prepare('SELECT * FROM sso_challenges WHERE id = ?').get(challengeId) as any;
