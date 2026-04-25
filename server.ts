@@ -727,6 +727,8 @@ app.get('/api/admin/users', authMiddleware, requireAdmin, (req, res) => {
 app.post('/api/admin/users', authMiddleware, requireAdmin, async (req, res) => {
   const { username, password, role, displayName } = req.body || {};
   if (!username || !password) return res.status(400).json({ error: '用户名和密码不能为空' });
+  if (!/^[a-zA-Z0-9_]+$/.test(username)) return res.status(400).json({ error: '用户名只能包含字母、数字和下划线' });
+  if (username.length < 3 || username.length > 20) return res.status(400).json({ error: '用户名长度必须在3到20个字符之间' });
   if (!['admin', 'employee'].includes(role)) return res.status(400).json({ error: '角色不合法' });
   if (!isStrongPassword(password)) return res.status(400).json({ error: '初始密码强度不足' });
   const exists = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
@@ -747,9 +749,17 @@ app.patch('/api/admin/users/:id', authMiddleware, requireAdmin, async (req: any,
   if (role && !['admin', 'employee'].includes(role)) return res.status(400).json({ error: '角色不合法' });
   if (status && !['active', 'disabled'].includes(status)) return res.status(400).json({ error: '状态不合法' });
 
+  const nextRole = role || user.role;
+  const nextStatus = status || user.status;
+  const adminCountRow = db.prepare("SELECT COUNT(*) as cnt FROM users WHERE role = 'admin' AND status = 'active'").get() as { cnt: number };
+  const isLastActiveAdmin = user.role === 'admin' && user.status === 'active' && Number(adminCountRow?.cnt || 0) <= 1;
+  if (isLastActiveAdmin && (nextRole !== 'admin' || nextStatus !== 'active')) {
+    return res.status(400).json({ error: '系统至少需要保留一个启用状态的管理员账号' });
+  }
+
   if (role) db.prepare('UPDATE users SET role = ? WHERE id = ?').run(role, id);
   if (status) db.prepare('UPDATE users SET status = ? WHERE id = ?').run(status, id);
-  if (displayName) db.prepare('UPDATE users SET display_name = ? WHERE id = ?').run(displayName, id);
+  if (typeof displayName === 'string') db.prepare('UPDATE users SET display_name = ? WHERE id = ?').run(displayName.trim() || user.username, id);
   if (resetPassword) {
     if (!isStrongPassword(resetPassword)) {
       return res.status(400).json({ error: '重置密码强度不足' });
