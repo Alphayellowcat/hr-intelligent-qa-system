@@ -94,6 +94,15 @@ export function Chat({ mode, modeId, systemPrompt, welcomeMessage, knowledgeBase
     }
   };
 
+  const unwrapMarkdownFence = (content: string): string => {
+    const trimmed = (content || '').trim();
+    const fenceMatch = trimmed.match(/^```(?:markdown|md)?\s*\n([\s\S]*?)\n```$/i);
+    if (fenceMatch && fenceMatch[1]) {
+      return fenceMatch[1].trim();
+    }
+    return trimmed;
+  };
+
   const compressReferences = (
     sources: Set<string>,
     evidenceItems: EvidenceItem[],
@@ -177,7 +186,9 @@ export function Chat({ mode, modeId, systemPrompt, welcomeMessage, knowledgeBase
     const el = textareaRef.current;
     if (!el) return;
     el.style.height = 'auto';
-    el.style.height = `${Math.min(el.scrollHeight, 140)}px`;
+    const nextHeight = Math.min(el.scrollHeight, 140);
+    el.style.height = `${nextHeight}px`;
+    el.style.overflowY = el.scrollHeight > 140 ? 'auto' : 'hidden';
   };
 
   useEffect(() => {
@@ -655,6 +666,7 @@ ${finalContent || '（无）'}
       if (boundaryContent) {
         finalContent = boundaryContent;
       }
+      finalContent = unwrapMarkdownFence(finalContent);
 
       if (finalContent) {
         const evidenceBoard = Array.from(evidenceBoardMap.values());
@@ -793,7 +805,7 @@ ${finalContent || '（无）'}
                 <>
                   <div className="markdown-body prose prose-sm max-w-none prose-slate">
                     <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                      {msg.content}
+                      {unwrapMarkdownFence(msg.content)}
                     </ReactMarkdown>
                   </div>
                   
@@ -895,7 +907,7 @@ ${finalContent || '（无）'}
             onKeyDown={handleInputKeyDown}
             rows={1}
             placeholder="输入您的问题...（Enter 发送，Shift+Enter 换行）"
-            className="w-full pl-4 pr-12 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all resize-none"
+            className="w-full pl-4 pr-12 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all resize-none overflow-y-hidden"
             disabled={isLoading}
           />
           <button
