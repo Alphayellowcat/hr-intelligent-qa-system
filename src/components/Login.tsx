@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { apiFetch, setToken } from '../api';
-import { User, Lock, Loader2, QrCode, ShieldCheck, Smartphone } from 'lucide-react';
+import { User, Lock, Loader2, QrCode, ShieldCheck, Smartphone, Eye, EyeOff } from 'lucide-react';
 
 interface LoginProps {
   onLogin: (user: any) => void;
@@ -33,10 +33,14 @@ export function Login({ onLogin }: LoginProps) {
   const [expiresAt, setExpiresAt] = useState('');
   const [scanUser, setScanUser] = useState('');
   const [ssoStatus, setSsoStatus] = useState<SsoStatus>('idle');
+  const [mockEnabled, setMockEnabled] = useState(false);
+  const [mockKey, setMockKey] = useState('');
 
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
 
   const statusLabel = useMemo(() => {
     if (ssoStatus === 'pending') return '等待扫码';
@@ -60,6 +64,7 @@ export function Login({ onLogin }: LoginProps) {
       .then((data) => {
         if (Array.isArray(data?.providers)) {
           setProviderConfigs(data.providers);
+          setMockEnabled(!!data.mockEnabled);
           const firstEnabled = data.providers.find((p: ProviderConfig) => p.enabled);
           if (firstEnabled) setSsoProvider(firstEnabled.id);
         }
@@ -156,7 +161,8 @@ export function Login({ onLogin }: LoginProps) {
     try {
       await apiFetch('/api/auth/sso/mock/complete', {
         method: 'POST',
-        body: JSON.stringify({ challengeId, username: scanUser.trim() })
+        body: JSON.stringify({ challengeId, username: scanUser.trim() }),
+        headers: mockKey ? { 'x-mock-sso-key': mockKey } : undefined
       });
       setSuccess('模拟扫码已提交，正在完成登录...');
       await pollSsoStatus();
@@ -213,7 +219,10 @@ export function Login({ onLogin }: LoginProps) {
                 <label className="block text-sm font-medium text-slate-700 mb-1">密码</label>
                 <div className="relative">
                   <Lock className="absolute left-3 top-1/2 -translate-y-1/2 h-5 w-5 text-slate-400" />
-                  <input type="password" required value={password} onChange={(e) => setPassword(e.target.value)} className="w-full pl-10 pr-3 py-2.5 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500" placeholder="输入密码" />
+                  <input type={showPassword ? 'text' : 'password'} required value={password} onChange={(e) => setPassword(e.target.value)} className="w-full pl-10 pr-10 py-2.5 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500" placeholder="输入密码" />
+                  <button type="button" onClick={() => setShowPassword((v) => !v)} className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-slate-400 hover:text-slate-600">
+                    {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                  </button>
                 </div>
               </div>
 
@@ -222,7 +231,10 @@ export function Login({ onLogin }: LoginProps) {
                   <label className="block text-sm font-medium text-slate-700 mb-1">确认密码</label>
                   <div className="relative">
                     <Lock className="absolute left-3 top-1/2 -translate-y-1/2 h-5 w-5 text-slate-400" />
-                    <input type="password" required value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} className="w-full pl-10 pr-3 py-2.5 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500" placeholder="再次输入密码" />
+                    <input type={showConfirmPassword ? 'text' : 'password'} required value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} className="w-full pl-10 pr-10 py-2.5 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500" placeholder="再次输入密码" />
+                    <button type="button" onClick={() => setShowConfirmPassword((v) => !v)} className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-slate-400 hover:text-slate-600">
+                      {showConfirmPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                    </button>
                   </div>
                 </div>
               )}
@@ -276,13 +288,18 @@ export function Login({ onLogin }: LoginProps) {
                 </div>
               </div>
 
-              <div className="rounded-xl border border-dashed border-amber-300 bg-amber-50 p-3">
-                <p className="text-xs text-amber-700">Demo 联调模式：输入用户名模拟扫码回调（生产环境接入企业微信/飞书 OAuth 回调）。</p>
-                <div className="mt-2 flex gap-2">
-                  <input value={scanUser} onChange={(e) => setScanUser(e.target.value)} placeholder="模拟扫码用户名" className="flex-1 px-3 py-2 border border-amber-200 rounded-lg text-sm" />
-                  <button type="button" onClick={simulateScan} className="px-3 py-2 text-sm rounded-lg bg-amber-600 text-white disabled:opacity-50" disabled={isLoading || !scanUser || !challengeId}>模拟扫码</button>
+              {mockEnabled && (
+                <div className="rounded-xl border border-dashed border-amber-300 bg-amber-50 p-3">
+                  <p className="text-xs text-amber-700">Demo 联调模式：输入用户名模拟扫码回调（生产环境请关闭 SSO_MOCK_ENABLED）。</p>
+                  <div className="mt-2 space-y-2">
+                    <div className="flex gap-2">
+                      <input value={scanUser} onChange={(e) => setScanUser(e.target.value)} placeholder="模拟扫码用户名" className="flex-1 px-3 py-2 border border-amber-200 rounded-lg text-sm" />
+                      <button type="button" onClick={simulateScan} className="px-3 py-2 text-sm rounded-lg bg-amber-600 text-white disabled:opacity-50" disabled={isLoading || !scanUser || !challengeId}>模拟扫码</button>
+                    </div>
+                    <input value={mockKey} onChange={(e) => setMockKey(e.target.value)} placeholder="可选：Mock Key（服务端配置了 SSO_MOCK_KEY 时必填）" className="w-full px-3 py-2 border border-amber-200 rounded-lg text-sm" />
+                  </div>
                 </div>
-              </div>
+              )}
             </div>
           )}
 
